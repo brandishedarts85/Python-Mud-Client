@@ -21,6 +21,23 @@ MSDP) — nothing derived from GMud32's source or binary.
   bespoke DSL — a trigger's "action" is just a callable.
 - **`example_wire.py`** — ~50 lines showing how a real UI would connect
   the three layers. Not a UI itself.
+- **`app.py`** — the minimal usable UI: a [Textual](https://textual.textualize.io/)
+  TUI wiring all three layers together. Scrollback pane (with real
+  ANSI colors rendered via Rich), a status bar (shows connection state
+  and live GMCP vitals when the server sends `Char.Vitals`), an input
+  bar with command history, and a 100ms tick loop driving automation
+  timers. Run it with:
+
+      pip install -r requirements.txt
+      python3 app.py mud.example.com 4000
+
+  Textual was picked over Qt/PySide6 for this first pass specifically
+  because `ansi_parser.py`'s `StyledLine`/`Segment` model maps almost
+  directly onto Rich's `Text`/`Style` objects — no widget-toolkit color
+  translation layer needed yet. A GUI toolkit is still the likely
+  long-term choice once split panes, mouse selection, or an embedded
+  map view matter; the rendering layer doesn't care which UI consumes
+  it.
 
 ## What's been verified (not just written — actually run)
 
@@ -43,6 +60,11 @@ MSDP) — nothing derived from GMud32's source or binary.
   blank line); bare `\r`-only line endings; Unicode/emoji passthrough.
 - Automation: alias expansion with capture groups, trigger firing with
   gag suppression, one-shot auto-disable, and timer scheduling/firing.
+- **`app.py`**, headless, via Textual's `run_test()` harness against the
+  same kind of fake in-process server: connects and renders incoming
+  text into scrollback, GMCP `Char.Vitals` updates the status bar,
+  an alias registered at runtime expands and sends correctly, and
+  up/down arrow command history recall works.
 
 Run `python3 -m py_compile *.py` to sanity check, or point
 `example_wire.py` at a real MUD to see it end to end.
