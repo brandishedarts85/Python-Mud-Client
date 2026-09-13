@@ -10,12 +10,23 @@ give you a usable client today, not to be the final UI.
 Usage:
     python3 app.py                      # opens a connect screen
     python3 app.py mud.example.com 4000 # connects immediately
+    python3 app.py despair              # connects using a saved profile
 
 Keys:
     Enter           send the current input line
     Up / Down       command history
     Ctrl+P          command palette (built into Textual)
     Ctrl+C          quit
+
+In-app slash commands (typed into the input bar, not sent to the MUD):
+    #alias PATTERN = EXPANSION
+    #unalias PATTERN
+    #trigger PATTERN = RESPONSE [:: gag] [oneshot] [cooldown=N]
+    #untrigger PATTERN
+    #list                          show current aliases/triggers
+    #save                          persist aliases/triggers to automation.json
+    #saveprofile NAME               save the current host/port to profiles.json
+    #help                          show this list
 """
 
 from __future__ import annotations
@@ -37,6 +48,13 @@ from textual.widgets import Footer, Header, Input, RichLog, Static
 from ansi_parser import AnsiParser, Scrollback, Segment, Style, StyledLine
 from automation import AutomationEngine
 from client_core import EventBus, EventType, MudConnection
+from persistence import (
+    DEFAULT_AUTOMATION_PATH,
+    load_automation,
+    resolve_connection,
+    save_automation,
+    save_profile,
+)
 
 
 def style_to_rich(style: Style) -> RichStyle:
@@ -148,6 +166,7 @@ class MudClientApp(App):
     async def start_connection(self, host: str, port: int) -> None:
         self.conn = MudConnection(host, port, self.bus, terminal_type="PyMudClient")
         self.engine = AutomationEngine(send_fn=self.conn.send_line)
+        n_aliases, n_triggers = load_automation(self.engine, DEFAULT_AUTOMATION_PATH)
         self._wire_bus()
 
         self._set_status(f"connecting to {host}:{port}...")
@@ -157,6 +176,12 @@ class MudClientApp(App):
             self._write_system_line(f"[connection failed: {exc}]")
             self._set_status("disconnected")
             return
+
+        if n_aliases or n_triggers:
+            self._write_system_line(
+                f"[loaded {n_aliases} alias(es) and {n_triggers} trigger(s) from "
+                f"{DEFAULT_AUTOMATION_PATH}]"
+            )
 
         if self._tick_task is None:
             self._tick_task = asyncio.create_task(self._tick_loop())
@@ -228,6 +253,10 @@ class MudClientApp(App):
         command = event.value
         event.input.value = ""
 
+        if command.startswith("#"):
+            self._handle_slash_command(command[1:].strip())
+            return
+
         if self.conn is None or self.engine is None:
             self._write_system_line("[not connected]")
             return
@@ -243,6 +272,105 @@ class MudClientApp(App):
             # blank line rather than swallowing it, but don't pollute
             # history with empty entries.
             self.conn.send_line("")
+
+    def _handle_slash_command(self, body: str) -> None:
+        """Client-side commands, never sent to the MUD. `body` is
+        everything after the leading '#', already stripped."""
+        if self.engine is None:
+            self._write_system_line("[not connected -- slash commands need an active engine]")
+            return
+
+        parts = body.split(None, 1)
+        cmd = parts[0].lower() if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+
+        if cmd == "alias":
+            if " = " not in rest:
+                self._write_system_line("[usage: #alias PATTERN = EXPANSION]")
+                return
+            pattern, expansion = rest.split(" = ", 1)
+            self.engine.add_alias(pattern.strip(), expansion.strip())
+            self._write_system_line(f"[alias added: {pattern.strip()!r} -> {expansion.strip()!r}]")
+
+        elif cmd == "unalias":
+            pattern = rest.strip()
+            removed = self._remove_by_pattern(self.engine.aliases, pattern)
+            self._write_system_line(f"[removed {removed} alias(es) matching {pattern!r}]")
+
+        elif cmd == "trigger":
+            if " = " not in rest:
+                self._write_system_line(
+                    "[usage: #trigger PATTERN = RESPONSE  [:: gag] [oneshot] [cooldown=N]]"
+                )
+                return
+            pattern, remainder = rest.split(" = ", 1)
+            response, flags = remainder, ""
+            if " :: " in remainder:
+                response, flags = remainder.split(" :: ", 1)
+            gag = "gag" in flags.split()
+            one_shot = "oneshot" in flags.split()
+            cooldown_s = 0.0
+            for token in flags.split():
+                if token.startswith("cooldown="):
+                    try:
+                        cooldown_s = float(token.split("=", 1)[1])
+                    except ValueError:
+                        pass
+            self.engine.add_simple_trigger(
+                pattern.strip(), response.strip(), gag=gag, one_shot=one_shot, cooldown_s=cooldown_s
+            )
+            self._write_system_line(
+                f"[trigger added: {pattern.strip()!r} -> {response.strip()!r}"
+                f"{' (gag)' if gag else ''}{' (one-shot)' if one_shot else ''}"
+                f"{f' (cooldown {cooldown_s}s)' if cooldown_s else ''}]"
+            )
+
+        elif cmd == "untrigger":
+            pattern = rest.strip()
+            removed = self._remove_by_pattern(self.engine.triggers, pattern)
+            self._write_system_line(f"[removed {removed} trigger(s) matching {pattern!r}]")
+
+        elif cmd == "list":
+            alias_lines = [f"  alias:   {a.pattern!r} -> {a.expansion!r}"
+                            for a in self.engine.aliases.values() if isinstance(a.expansion, str)]
+            trigger_lines = [f"  trigger: {t.pattern!r} -> {t.response_template!r}"
+                              for t in self.engine.triggers.values() if t.response_template is not None]
+            if not alias_lines and not trigger_lines:
+                self._write_system_line("[no aliases or triggers defined]")
+            else:
+                self._write_system_line("[aliases/triggers]")
+                for line in alias_lines + trigger_lines:
+                    self._write_system_line(line)
+
+        elif cmd == "save":
+            save_automation(self.engine, DEFAULT_AUTOMATION_PATH)
+            self._write_system_line(f"[saved aliases/triggers to {DEFAULT_AUTOMATION_PATH}]")
+
+        elif cmd == "saveprofile":
+            name = rest.strip()
+            if not name:
+                self._write_system_line("[usage: #saveprofile NAME]")
+            elif self.conn is None:
+                self._write_system_line("[not connected -- nothing to save]")
+            else:
+                save_profile(name, self.conn.host, self.conn.port)
+                self._write_system_line(f"[saved profile {name!r} -> {self.conn.host}:{self.conn.port}]")
+
+        elif cmd == "help" or cmd == "":
+            self._write_system_line(
+                "[commands: #alias P = E | #unalias P | #trigger P = R [:: gag oneshot "
+                "cooldown=N] | #untrigger P | #list | #save | #saveprofile NAME]"
+            )
+
+        else:
+            self._write_system_line(f"[unknown command: #{cmd} -- try #help]")
+
+    @staticmethod
+    def _remove_by_pattern(store: dict, pattern: str) -> int:
+        to_remove = [id_ for id_, obj in store.items() if obj.pattern == pattern]
+        for id_ in to_remove:
+            del store[id_]
+        return len(to_remove)
 
     async def on_key(self, event: events.Key) -> None:
         input_widget = self.query_one("#inputbar", Input)
@@ -269,8 +397,14 @@ class MudClientApp(App):
 
 
 def main() -> None:
-    host = sys.argv[1] if len(sys.argv) > 1 else None
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else None
+    arg1 = sys.argv[1] if len(sys.argv) > 1 else None
+    arg2 = sys.argv[2] if len(sys.argv) > 2 else None
+    host, port = resolve_connection(arg1, arg2)
+    if host and port is None:
+        print(f"'{host}' isn't a saved profile and no port was given.")
+        print("Usage: python3 app.py <host> <port>")
+        print("   or: python3 app.py <saved-profile-name>")
+        sys.exit(1)
     app = MudClientApp(host=host, port=port)
     app.run()
 

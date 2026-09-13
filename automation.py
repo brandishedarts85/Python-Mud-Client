@@ -92,6 +92,11 @@ class Trigger:
     one_shot: bool = False                          # auto-disable after first fire
     cooldown_s: float = 0.0                          # minimum seconds between fires
     case_sensitive: bool = False
+    response_template: Optional[str] = None          # set only for triggers built via
+                                                       # add_simple_trigger/%N-substitution;
+                                                       # lets persistence.py round-trip them.
+                                                       # None means "code-defined action,
+                                                       # don't try to serialize this."
     _regex: re.Pattern = field(init=False, repr=False)
     _last_fired: float = field(default=0.0, init=False, repr=False)
 
@@ -207,6 +212,46 @@ class AutomationEngine:
             one_shot=one_shot,
             cooldown_s=cooldown_s,
             case_sensitive=case_sensitive,
+        )
+        return tid
+
+    def add_simple_trigger(
+        self,
+        pattern: str,
+        response: str,
+        *,
+        gag: bool = False,
+        one_shot: bool = False,
+        cooldown_s: float = 0.0,
+        case_sensitive: bool = False,
+        trigger_id: Optional[str] = None,
+    ) -> str:
+        """Like add_trigger, but the action is just "send this response
+        (with %1..%9 substituted from match groups), possibly several
+        commands separated by ;;" -- no Python callable required. This
+        is the form used by in-app slash commands and by
+        persistence.py, since a plain string round-trips through JSON
+        and an arbitrary callable can't."""
+
+        def action(match: re.Match, ctx: TriggerContext) -> None:
+            text = response
+            for i, g in enumerate(match.groups(), start=1):
+                text = text.replace(f"%{i}", g or "")
+            for cmd in text.split(";;"):
+                cmd = cmd.strip()
+                if cmd:
+                    ctx.send(cmd)
+
+        tid = trigger_id or str(uuid.uuid4())
+        self.triggers[tid] = Trigger(
+            id=tid,
+            pattern=pattern,
+            action=action,
+            gag=gag,
+            one_shot=one_shot,
+            cooldown_s=cooldown_s,
+            case_sensitive=case_sensitive,
+            response_template=response,
         )
         return tid
 

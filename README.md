@@ -38,6 +38,20 @@ MSDP) — nothing derived from GMud32's source or binary.
   long-term choice once split panes, mouse selection, or an embedded
   map view matter; the rendering layer doesn't care which UI consumes
   it.
+- **`persistence.py`** — connection profiles and automation (aliases/
+  simple triggers) as flat JSON files (`profiles.json`,
+  `automation.json`), so a session survives a restart. Run with a
+  saved profile name instead of retyping host/port:
+
+      python3 app.py despair
+
+  In-app slash commands (typed into the input bar, never sent to the
+  MUD): `#alias P = E`, `#unalias P`, `#trigger P = R [:: gag]
+  [oneshot] [cooldown=N]`, `#untrigger P`, `#list`, `#save`,
+  `#saveprofile NAME`, `#help`. Only "simple" aliases/triggers (a
+  plain response string, not an arbitrary Python callable) round-trip
+  through the JSON files — code-defined automation from
+  `example_wire.py`-style scripts stays in code, by design.
 
 ## What's been verified (not just written — actually run)
 
@@ -65,6 +79,24 @@ MSDP) — nothing derived from GMud32's source or binary.
   text into scrollback, GMCP `Char.Vitals` updates the status bar,
   an alias registered at runtime expands and sends correctly, and
   up/down arrow command history recall works.
+- **Bugs found by testing against real MUDs** (Realms of Despair,
+  SMAUG-based, and Aardwolf) rather than by reasoning about the spec:
+  the Telnet EOR command byte was wrong (239, not 21, so servers using
+  EOR instead of GA to mark prompts were never detected); GA/EOR
+  handling emitted the prompt's content as a mislabeled `TEXT` event
+  and then a redundant, empty `PROMPT` event; and `ansi_parser.py`
+  never advanced its internal buffer pointer after flushing plain text
+  with no trailing newline, so a no-newline prompt got re-processed
+  and duplicated on the next `feed()` call. All three are exactly the
+  kind of bug a synthetic test server won't surface — worth remembering
+  next time something seems clean in tests but real servers still find
+  a way to break it.
+- **`persistence.py`**: round-trips aliases and simple triggers through
+  JSON (including gag/one-shot/cooldown fidelity), connection-profile
+  save/resolve/override precedence, missing-file handling, and the
+  full slash-command flow (`#alias`, `#trigger`, `#list`, `#save`,
+  `#saveprofile`, removal) driven through Textual's `run_test()` pilot
+  end-to-end.
 
 Run `python3 -m py_compile *.py` to sanity check, or point
 `example_wire.py` at a real MUD to see it end to end.
