@@ -162,8 +162,8 @@ class MudClientApp(App):
             self._tick_task = asyncio.create_task(self._tick_loop())
 
     def _wire_bus(self) -> None:
-        self.bus.on(EventType.TEXT, lambda e: self._on_incoming(e.data))
-        self.bus.on(EventType.PROMPT, lambda e: self._on_incoming(e.data))
+        self.bus.on(EventType.TEXT, lambda e: self._on_incoming(e.data, is_prompt=False))
+        self.bus.on(EventType.PROMPT, lambda e: self._on_incoming(e.data, is_prompt=True))
         self.bus.on(EventType.CONNECTED, lambda e: self._on_connected(e.data))
         self.bus.on(EventType.DISCONNECTED, lambda e: self._on_disconnected())
         self.bus.on(EventType.GMCP, lambda e: self._on_gmcp(e.data))
@@ -184,8 +184,17 @@ class MudClientApp(App):
             if hp is not None and maxhp is not None:
                 self._set_status(f"connected  |  HP {hp}/{maxhp}")
 
-    def _on_incoming(self, raw_text: str) -> None:
-        for line in self.ansi.feed(raw_text):
+    def _on_incoming(self, raw_text: str, is_prompt: bool = False) -> None:
+        lines = self.ansi.feed(raw_text)
+        if is_prompt:
+            # a GA/EOR-marked prompt never ends in \r\n, so ansi.feed()
+            # above won't have completed it on its own -- force the
+            # boundary now so it renders immediately instead of fusing
+            # with whatever text arrives next.
+            flushed = self.ansi.flush_line()
+            if flushed is not None:
+                lines = lines + [flushed]
+        for line in lines:
             self.scrollback.append(line)
             plain = line.plain_text()
             kept = self.engine.on_text(plain) if self.engine else plain

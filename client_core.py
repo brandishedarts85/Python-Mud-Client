@@ -49,7 +49,10 @@ SE = 240    # Subnegotiation end
 OPT_ECHO = 1
 OPT_SGA = 3          # Suppress Go Ahead
 OPT_TTYPE = 24       # Terminal type
-OPT_EOR = 25         # End of record (prompt marker used by many MUDs)
+OPT_EOR = 25         # End of record (the *option*, negotiated via WILL/DO)
+EOR_MARK = 239       # IAC EOR -- the actual command byte servers send to
+                     # mark "this is a complete prompt, no newline follows".
+                     # Distinct from OPT_EOR above; easy to conflate.
 OPT_NAWS = 31        # Negotiate About Window Size
 OPT_MSDP = 69
 OPT_MCCP2 = 86
@@ -315,8 +318,15 @@ class MudConnection:
                     self._sb_buffer.clear()
                     self._sb_option = None
                     self._state = _TelnetState.SUBNEG
-                elif b in (GA, 21):  # GA (249) or EOR (239, some stacks send this)
-                    flush_text()
+                elif b in (GA, EOR_MARK):  # GA (249) or IAC EOR (239)
+                    # NOTE: deliberately NOT flush_text() here -- that
+                    # emits a TEXT event and clears the pending buffer,
+                    # which would leave _emit_prompt() with nothing to
+                    # send. Move the accumulated bytes over directly so
+                    # they go out as PROMPT, not TEXT.
+                    if text_run:
+                        self._pending_text_bytes.extend(text_run)
+                        text_run.clear()
                     self._emit_prompt()
                     self._state = _TelnetState.DATA
                 else:

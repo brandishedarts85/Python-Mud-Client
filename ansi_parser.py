@@ -125,10 +125,12 @@ class AnsiParser:
         plain_start = i
 
         def flush_plain(end: int) -> None:
+            nonlocal plain_start
             if end > plain_start:
                 chunk = buf[plain_start:end]
                 if chunk:
                     self._current.segments.append(Segment(chunk, self._style))
+                plain_start = end
 
         while i < n:
             ch = buf[i]
@@ -185,6 +187,19 @@ class AnsiParser:
 
     def current_line(self) -> StyledLine:
         return self._current
+
+    def flush_line(self) -> Optional[StyledLine]:
+        """Forcibly ends the in-progress line without a real newline --
+        for telnet prompt markers (GA/EOR), which signal 'this is a
+        complete prompt' but never send \\r\\n themselves. Without this,
+        a no-newline prompt sits in the buffer and gets glued onto
+        whatever text arrives next. Returns None if there's nothing
+        pending (avoids emitting spurious empty lines back-to-back)."""
+        if not self._current.segments and not self._buffer:
+            return None
+        line = self._current
+        self._current = StyledLine()
+        return line
 
     # -- SGR / CSI handling --------------------------------------------
 
