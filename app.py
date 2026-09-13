@@ -218,17 +218,22 @@ class MudClientApp(App):
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         command = event.value
         event.input.value = ""
-        if not command:
-            return
-        self._history.append(command)
-        self._history_pos = len(self._history)
 
         if self.conn is None or self.engine is None:
             self._write_system_line("[not connected]")
             return
 
-        for cmd in self.engine.on_command(command):
-            self.conn.send_line(cmd)
+        if command:
+            self._history.append(command)
+            self._history_pos = len(self._history)
+            for cmd in self.engine.on_command(command):
+                self.conn.send_line(cmd)
+        else:
+            # a bare Enter is meaningful to most MUDs (paging through
+            # --more--, repeating the last look, etc.) -- send it as a
+            # blank line rather than swallowing it, but don't pollute
+            # history with empty entries.
+            self.conn.send_line("")
 
     async def on_key(self, event: events.Key) -> None:
         input_widget = self.query_one("#inputbar", Input)
