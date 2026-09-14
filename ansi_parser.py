@@ -2,42 +2,56 @@
 ansi_parser.py -- the renderer.
 
 Turns raw text (as delivered by client_core's TEXT/PROMPT events) into a
-UI-agnostic sequence of styled segments: plain strings tagged with a
-Style describing color/attributes. Any UI layer (Qt, Textual, a browser
-via HTML, a curses screen) consumes StyledLine objects and draws them
-however it likes -- this module never touches a widget.
+UI-agnostic sequence of styled segments: plain strings tagged with a Style
+describing color/attributes. Any UI layer (Qt, Textual, a browser via HTML,
+a curses screen) consumes StyledLine objects and draws them however it likes;
+this module never touches a widget.
 
 Covers:
-  - classic ANSI SGR: 16-color, bold/dim/italic/underline/blink/reverse
+  - classic ANSI SGR: 16-color, bold/dim/italic/underline/blink/reverse/strike
   - xterm 256-color (38;5;n / 48;5;n)
   - truecolor (38;2;r;g;b / 48;2;r;g;b)
-  - reset codes, combined SGR sequences (e.g. \x1b[1;32;44m)
+  - colon-form extended color where practical (e.g. 38:2:r:g:b)
+  - reset codes and combined SGR sequences
   - CR/LF and bare CR normalization
-  - a bounded scrollback buffer of finished lines
+  - safe recognition/discard of unsupported CSI/OSC/ESC sequences
+  - split escape sequences across feed() calls
+  - bounded scrollback
 
-Non-SGR CSI sequences (cursor movement, clear screen, etc.) are
-recognized and discarded by default -- most MUDs don't rely on them,
-and a client that mis-renders cursor-addressed full-screen apps (rare
-on MUDs) is far less annoying than one that leaks raw escape codes into
-the scrollback.
+Design rule:
+    recognize broadly, interpret narrowly, discard safely.
+
+Only SGR meaning is interpreted. Other terminal control sequences are consumed
+without being exposed as visible text.
 """
 
 from __future__ import annotations
 
-import re
-import unicodedata
-from dataclasses import dataclass, field
-from typing import Optional
+from collections import deque
+from dataclasses import dataclass, field, replace
+from typing import Deque, Optional
 
-CSI_RE = re.compile(r"\x1b\[([0-9;:]*)([A-Za-z])")
 
 # xterm 256-color palette (0-15 match the standard 16 ANSI colors)
-_XTERM_256 = None  # built lazily, see _xterm256()
+_XTERM_256: Optional[list[tuple[int, int, int]]] = None
+
+# The 16 base ANSI colors as RGB, used for SGR 30-37/40-47/90-97/100-107.
+_BASE16 = [
+    (0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0),
+    (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229),
+    (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0),
+    (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+]
+
+# Conservative caps for defensive parsing.
+_MAX_CSI_LEN = 128
+_MAX_OSC_LEN = 4096
+_MAX_SGR_PARAMS = 64
 
 
 @dataclass(frozen=True)
 class Style:
-    fg: Optional[tuple[int, int, int]] = None   # RGB, None = default
+    fg: Optional[tuple[int, int, int]] = None
     bg: Optional[tuple[int, int, int]] = None
     bold: bool = False
     dim: bool = False
@@ -48,14 +62,13 @@ class Style:
     strike: bool = False
 
     def merged(self, **changes) -> "Style":
-        data = self.__dict__ | changes
-        return Style(**data)
+        return replace(self, **changes)
 
 
 DEFAULT_STYLE = Style()
 
 
-@dataclass
+@dataclass(frozen=True)
 class Segment:
     text: str
     style: Style
@@ -66,103 +79,97 @@ class StyledLine:
     segments: list[Segment] = field(default_factory=list)
 
     def plain_text(self) -> str:
-        return "".join(s.text for s in self.segments)
-
-
-# The 16 base ANSI colors as RGB, used for SGR 30-37/40-47/90-97/100-107
-_BASE16 = [
-    (0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0),
-    (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229),
-    (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0),
-    (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
-]
+        return "".join(segment.text for segment in self.segments)
 
 
 def _xterm256() -> list[tuple[int, int, int]]:
     global _XTERM_256
     if _XTERM_256 is not None:
         return _XTERM_256
+
     palette = list(_BASE16)
-    # 216-color cube (16-231)
+
     steps = [0, 95, 135, 175, 215, 255]
     for r in range(6):
         for g in range(6):
             for b in range(6):
                 palette.append((steps[r], steps[g], steps[b]))
-    # grayscale ramp (232-255)
+
     for i in range(24):
-        v = 8 + i * 10
-        palette.append((v, v, v))
+        value = 8 + i * 10
+        palette.append((value, value, value))
+
     _XTERM_256 = palette
     return palette
 
 
 class AnsiParser:
     """
-    Stateful ANSI-to-styled-text parser. Feed it raw chunks of text
-    (possibly split mid-escape-sequence across chunks -- that's fine,
-    state persists across calls) and get back StyledLine objects for
-    each completed line, plus the current in-progress line.
+    Stateful ANSI-to-styled-text parser.
+
+    feed() accepts already-decoded Unicode text. Chunks may split escape
+    sequences or CRLF pairs; parser state is retained between calls.
+
+    Completed newline-terminated lines are returned from feed().
+    current_line() exposes the in-progress line.
+    flush_line() is intended for telnet GA/EOR prompt boundaries.
     """
 
     def __init__(self) -> None:
         self._style = DEFAULT_STYLE
-        self._buffer = ""            # unterminated raw text since last flush
+        self._buffer = ""
         self._current = StyledLine()
-        self._pending_cr = False     # saw \r, waiting to see if \n follows
 
     def feed(self, text: str) -> list[StyledLine]:
-        """Process a chunk of text (already UTF-8 decoded). Returns the
-        list of lines that were completed by this chunk. Use current_line()
-        to peek at the not-yet-terminated line (e.g. for a live prompt)."""
-        text = unicodedata.normalize("NFC", text)
+        if not text:
+            return []
+
         self._buffer += text
         completed: list[StyledLine] = []
 
-        i = 0
         buf = self._buffer
         n = len(buf)
-        plain_start = i
+        i = 0
+        plain_start = 0
+        hold_from: Optional[int] = None
 
         def flush_plain(end: int) -> None:
             nonlocal plain_start
-            if end > plain_start:
-                chunk = buf[plain_start:end]
-                if chunk:
-                    self._current.segments.append(Segment(chunk, self._style))
-                plain_start = end
+            if end <= plain_start:
+                return
+            chunk = buf[plain_start:end]
+            if chunk:
+                self._append_segment(chunk, self._style)
+            plain_start = end
 
         while i < n:
             ch = buf[i]
+
             if ch == "\x1b":
-                # need at least the CSI intro; if the escape sequence is
-                # split across chunks, stop here and wait for more data
-                m = CSI_RE.match(buf, i)
-                if m is None:
-                    if n - i < 32:  # plausibly a truncated sequence
-                        break
-                    # not a recognizable escape at all; drop the ESC byte
-                    flush_plain(i)
-                    i += 1
-                    plain_start = i
-                    continue
                 flush_plain(i)
-                self._apply_csi(m.group(1), m.group(2))
-                i = m.end()
+                consumed = self._consume_escape(buf, i)
+
+                if consumed is None:
+                    hold_from = i
+                    break
+
+                i = consumed
                 plain_start = i
                 continue
 
             if ch == "\r":
-                if i == n - 1:
-                    # could be the start of a split "\r\n" -- hold it back
-                    # and wait for the next chunk to decide
+                if i + 1 >= n:
+                    flush_plain(i)
+                    hold_from = i
                     break
+
                 flush_plain(i)
                 i += 1
-                plain_start = i
-                if buf[i] == "\n":
+
+                if i < n and buf[i] == "\n":
                     i += 1
-                    plain_start = i
+
+                plain_start = i
                 completed.append(self._current)
                 self._current = StyledLine()
                 continue
@@ -177,44 +184,224 @@ class AnsiParser:
 
             i += 1
 
-        flush_plain(i)
-        self._buffer = buf[plain_start:] if plain_start < n else ""
-        # if we stopped early because of a possibly-truncated escape, keep
-        # only the unconsumed tail for next time
-        if i < n:
-            self._buffer = buf[i:]
+        if hold_from is not None:
+            flush_plain(hold_from)
+            self._buffer = buf[hold_from:]
+        else:
+            flush_plain(n)
+            self._buffer = ""
+
         return completed
 
     def current_line(self) -> StyledLine:
         return self._current
 
     def flush_line(self) -> Optional[StyledLine]:
-        """Forcibly ends the in-progress line without a real newline --
-        for telnet prompt markers (GA/EOR), which signal 'this is a
-        complete prompt' but never send \\r\\n themselves. Without this,
-        a no-newline prompt sits in the buffer and gets glued onto
-        whatever text arrives next. Returns None if there's nothing
-        pending (avoids emitting spurious empty lines back-to-back)."""
-        if not self._current.segments and not self._buffer:
+        """
+        End the current logical line without requiring CR/LF.
+
+        Intended for telnet GA/EOR prompt boundaries. Buffered partial control
+        sequences are intentionally retained until more bytes arrive; they are
+        not exposed as visible prompt text.
+        """
+        if not self._current.segments:
             return None
+
         line = self._current
         self._current = StyledLine()
         return line
 
-    # -- SGR / CSI handling --------------------------------------------
+    def reset(self) -> None:
+        """Reset parser style, partial-control state, and current line."""
+        self._style = DEFAULT_STYLE
+        self._buffer = ""
+        self._current = StyledLine()
 
-    def _apply_csi(self, params: str, final: str) -> None:
-        if final != "m":
-            # cursor movement, clear-screen, etc. -- intentionally ignored
+    def _append_segment(self, text: str, style: Style) -> None:
+        """Append text while coalescing adjacent segments with equal style."""
+        if not text:
             return
+        if self._current.segments and self._current.segments[-1].style == style:
+            previous = self._current.segments[-1]
+            self._current.segments[-1] = Segment(previous.text + text, style)
+        else:
+            self._current.segments.append(Segment(text, style))
+
+    # ------------------------------------------------------------------
+    # Escape-sequence scanning
+    # ------------------------------------------------------------------
+
+    def _consume_escape(self, buf: str, start: int) -> Optional[int]:
+        """
+        Consume one escape/control sequence beginning at start.
+
+        Returns the index immediately after the consumed sequence.
+        Returns None when the sequence appears incomplete and should be held for
+        the next feed() call.
+
+        Unknown-but-complete ESC forms are discarded safely.
+        """
+        n = len(buf)
+        if start + 1 >= n:
+            return None
+
+        leader = buf[start + 1]
+
+        if leader == "[":
+            return self._consume_csi(buf, start)
+
+        if leader == "]":
+            return self._consume_osc(buf, start)
+
+        # DCS, SOS, PM, APC: string controls terminated by ST (ESC \).
+        if leader in ("P", "X", "^", "_"):
+            return self._consume_st_string(buf, start)
+
+        # Two-byte Fe-style escape sequence: ESC followed by a final byte.
+        # This safely consumes common sequences such as ESC 7 / ESC 8 / ESC c.
+        code = ord(leader)
+        if 0x30 <= code <= 0x7E:
+            return start + 2
+
+        # Intermediate-byte escape sequences may contain 0x20-0x2F followed by
+        # a final 0x30-0x7E. Scan only a very small bounded envelope.
+        i = start + 1
+        limit = min(n, start + 16)
+        while i < limit and 0x20 <= ord(buf[i]) <= 0x2F:
+            i += 1
+
+        if i < n and 0x30 <= ord(buf[i]) <= 0x7E:
+            return i + 1
+
+        # Invalid ESC byte followed by ordinary data: discard only ESC itself
+        # so visible text is not trapped indefinitely.
+        return start + 1
+
+    def _consume_csi(self, buf: str, start: int) -> Optional[int]:
+        """
+        Parse the ANSI CSI syntactic envelope.
+
+        CSI is:
+            ESC [
+            parameter bytes     0x30-0x3F
+            intermediate bytes  0x20-0x2F
+            final byte          0x40-0x7E
+
+        Only final 'm' (SGR) is interpreted. Everything else is discarded.
+        """
+        n = len(buf)
+        i = start + 2
+
+        if i >= n:
+            return None
+
+        max_end = min(n, start + _MAX_CSI_LEN)
+
+        param_start = i
+        while i < max_end and 0x30 <= ord(buf[i]) <= 0x3F:
+            i += 1
+        params = buf[param_start:i]
+
+        while i < max_end and 0x20 <= ord(buf[i]) <= 0x2F:
+            i += 1
+
+        if i >= n:
+            if n - start < _MAX_CSI_LEN:
+                return None
+            return start + 1
+
+        if i >= max_end:
+            return start + 1
+
+        final = buf[i]
+        if not (0x40 <= ord(final) <= 0x7E):
+            # Malformed CSI. Drop only the ESC and allow the rest to be
+            # reconsidered as ordinary input instead of stalling the stream.
+            return start + 1
+
+        if final == "m":
+            self._apply_sgr(params)
+
+        return i + 1
+
+    def _consume_osc(self, buf: str, start: int) -> Optional[int]:
+        """
+        Consume Operating System Command (OSC).
+
+        OSC terminates with BEL or ST (ESC \\). It is never rendered or
+        interpreted by this module.
+        """
+        n = len(buf)
+        i = start + 2
+        limit = min(n, start + _MAX_OSC_LEN)
+
+        while i < limit:
+            ch = buf[i]
+            if ch == "\x07":  # BEL terminator
+                return i + 1
+            if ch == "\x1b":
+                if i + 1 >= n:
+                    return None
+                if buf[i + 1] == "\\":
+                    return i + 2
+            i += 1
+
+        if limit == n and n - start < _MAX_OSC_LEN:
+            return None
+
+        # Pathological unterminated OSC: abandon the ESC so the parser makes
+        # forward progress rather than retaining arbitrary amounts of input.
+        return start + 1
+
+    def _consume_st_string(self, buf: str, start: int) -> Optional[int]:
+        """Consume DCS/SOS/PM/APC strings, terminated by ST (ESC \\)."""
+        n = len(buf)
+        i = start + 2
+        limit = min(n, start + _MAX_OSC_LEN)
+
+        while i < limit:
+            if buf[i] == "\x1b":
+                if i + 1 >= n:
+                    return None
+                if buf[i + 1] == "\\":
+                    return i + 2
+            i += 1
+
+        if limit == n and n - start < _MAX_OSC_LEN:
+            return None
+
+        return start + 1
+
+    # ------------------------------------------------------------------
+    # SGR
+    # ------------------------------------------------------------------
+
+    def _apply_sgr(self, params: str) -> None:
         if params == "":
             self._style = DEFAULT_STYLE
             return
-        codes = [int(p) if p else 0 for p in params.split(";")]
+
+        tokens = self._tokenize_sgr(params)
+        if tokens is None:
+            return
+
         style = self._style
         idx = 0
-        while idx < len(codes):
-            code = codes[idx]
+
+        while idx < len(tokens):
+            token = tokens[idx]
+
+            if isinstance(token, tuple):
+                kind = token[0]
+                if kind == "fg":
+                    style = style.merged(fg=token[1])
+                elif kind == "bg":
+                    style = style.merged(bg=token[1])
+                idx += 1
+                continue
+
+            code = token
+
             if code == 0:
                 style = DEFAULT_STYLE
             elif code == 1:
@@ -225,7 +412,7 @@ class AnsiParser:
                 style = style.merged(italic=True)
             elif code == 4:
                 style = style.merged(underline=True)
-            elif code == 5 or code == 6:
+            elif code in (5, 6):
                 style = style.merged(blink=True)
             elif code == 7:
                 style = style.merged(reverse=True)
@@ -245,81 +432,184 @@ class AnsiParser:
                 style = style.merged(strike=False)
             elif 30 <= code <= 37:
                 style = style.merged(fg=_BASE16[code - 30])
-            elif code == 38:
-                rgb, idx = self._parse_extended_color(codes, idx)
-                style = style.merged(fg=rgb)
-                idx += 1
-                continue
             elif code == 39:
                 style = style.merged(fg=None)
             elif 40 <= code <= 47:
                 style = style.merged(bg=_BASE16[code - 40])
-            elif code == 48:
-                rgb, idx = self._parse_extended_color(codes, idx)
-                style = style.merged(bg=rgb)
-                idx += 1
-                continue
             elif code == 49:
                 style = style.merged(bg=None)
             elif 90 <= code <= 97:
-                style = style.merged(fg=_BASE16[8 + (code - 90)])
+                style = style.merged(fg=_BASE16[8 + code - 90])
             elif 100 <= code <= 107:
-                style = style.merged(bg=_BASE16[8 + (code - 100)])
+                style = style.merged(bg=_BASE16[8 + code - 100])
+            elif code in (38, 48):
+                rgb, consumed = self._parse_extended_color_tokens(tokens, idx)
+                if rgb is not None:
+                    if code == 38:
+                        style = style.merged(fg=rgb)
+                    else:
+                        style = style.merged(bg=rgb)
+                idx = max(idx + 1, consumed + 1)
+                continue
+
             idx += 1
+
         self._style = style
 
     @staticmethod
-    def _parse_extended_color(codes: list[int], idx: int) -> tuple[Optional[tuple[int, int, int]], int]:
-        """codes[idx] is 38 or 48. Consumes the ';5;n' or ';2;r;g;b' that
-        follows and returns (rgb, new_idx) pointing at the last consumed code."""
-        if idx + 1 >= len(codes):
+    def _tokenize_sgr(
+        params: str,
+    ) -> Optional[list[int | tuple[str, tuple[int, int, int]]]]:
+        """
+        Tokenize SGR parameters.
+
+        Semicolon syntax is left as integers so 38/48 can consume following
+        parameters. Colon-form extended colors are normalized into synthetic
+        ('fg'/'bg', rgb) tokens.
+
+        Unknown/malformed colon groups are ignored rather than changing style.
+        """
+        raw_parts = params.split(";")
+        if len(raw_parts) > _MAX_SGR_PARAMS:
+            return None
+
+        tokens: list[int | tuple[str, tuple[int, int, int]]] = []
+
+        for raw in raw_parts:
+            if ":" not in raw:
+                if raw == "":
+                    tokens.append(0)
+                    continue
+                try:
+                    tokens.append(int(raw))
+                except ValueError:
+                    continue
+                continue
+
+            fields = raw.split(":")
+            try:
+                lead = int(fields[0]) if fields[0] else 0
+            except ValueError:
+                continue
+
+            # Common colon forms:
+            #   38:5:n
+            #   48:5:n
+            #   38:2:r:g:b
+            #   38:2::r:g:b  (optional colorspace id omitted)
+            if lead not in (38, 48) or len(fields) < 3:
+                continue
+
+            mode = fields[1]
+            rgb: Optional[tuple[int, int, int]] = None
+
+            if mode == "5" and len(fields) >= 3:
+                try:
+                    palette_index = int(fields[2])
+                except ValueError:
+                    continue
+                palette = _xterm256()
+                if 0 <= palette_index < len(palette):
+                    rgb = palette[palette_index]
+
+            elif mode == "2":
+                components = fields[2:]
+                if components and components[0] == "":
+                    components = components[1:]
+                if len(components) < 3:
+                    continue
+                try:
+                    r, g, b = (int(components[0]), int(components[1]), int(components[2]))
+                except ValueError:
+                    continue
+                if all(0 <= value <= 255 for value in (r, g, b)):
+                    rgb = (r, g, b)
+
+            if rgb is not None:
+                tokens.append(("fg" if lead == 38 else "bg", rgb))
+
+        return tokens
+
+    @staticmethod
+    def _parse_extended_color_tokens(
+        tokens: list[int | tuple[str, tuple[int, int, int]]],
+        idx: int,
+    ) -> tuple[Optional[tuple[int, int, int]], int]:
+        """
+        Parse semicolon-form extended colors beginning at tokens[idx] == 38/48.
+
+        Invalid requests leave the existing color unchanged.
+        """
+        if idx + 1 >= len(tokens) or not isinstance(tokens[idx + 1], int):
             return None, idx
-        mode = codes[idx + 1]
-        if mode == 5 and idx + 2 < len(codes):
-            n = codes[idx + 2]
+
+        mode = tokens[idx + 1]
+
+        if mode == 5:
+            if idx + 2 >= len(tokens) or not isinstance(tokens[idx + 2], int):
+                return None, idx + 1
+
+            palette_index = tokens[idx + 2]
             palette = _xterm256()
-            rgb = palette[n] if 0 <= n < len(palette) else None
-            return rgb, idx + 2
-        if mode == 2 and idx + 4 < len(codes):
-            r, g, b = codes[idx + 2], codes[idx + 3], codes[idx + 4]
-            return (r, g, b), idx + 4
+            if 0 <= palette_index < len(palette):
+                return palette[palette_index], idx + 2
+            return None, idx + 2
+
+        if mode == 2:
+            if idx + 4 >= len(tokens):
+                return None, idx + 1
+
+            values = tokens[idx + 2: idx + 5]
+            if not all(isinstance(value, int) for value in values):
+                return None, idx + 1
+
+            r, g, b = values
+            if all(0 <= value <= 255 for value in (r, g, b)):
+                return (r, g, b), idx + 4
+            return None, idx + 4
+
         return None, idx + 1
 
 
 class Scrollback:
-    """Bounded ring buffer of StyledLine, with a simple substring search."""
+    """Bounded ring buffer of StyledLine with simple substring search."""
 
     def __init__(self, max_lines: int = 10_000) -> None:
+        if max_lines <= 0:
+            raise ValueError("max_lines must be greater than zero")
         self.max_lines = max_lines
-        self._lines: list[StyledLine] = []
+        self._lines: Deque[StyledLine] = deque(maxlen=max_lines)
 
     def append(self, line: StyledLine) -> None:
         self._lines.append(line)
-        if len(self._lines) > self.max_lines:
-            del self._lines[: len(self._lines) - self.max_lines]
 
     def extend(self, lines: list[StyledLine]) -> None:
-        for line in lines:
-            self.append(line)
+        self._lines.extend(lines)
 
     def __len__(self) -> int:
         return len(self._lines)
 
     def __getitem__(self, idx):
+        # Preserve simple list-like indexing/slicing for callers.
+        if isinstance(idx, slice):
+            return list(self._lines)[idx]
         return self._lines[idx]
 
     def search(self, needle: str, case_sensitive: bool = False) -> list[int]:
-        """Returns indices of lines whose plain text contains needle."""
         if not case_sensitive:
-            needle = needle.lower()
-        hits = []
+            needle = needle.casefold()
+
+        hits: list[int] = []
         for i, line in enumerate(self._lines):
             text = line.plain_text()
             if not case_sensitive:
-                text = text.lower()
+                text = text.casefold()
             if needle in text:
                 hits.append(i)
         return hits
 
     def tail(self, n: int) -> list[StyledLine]:
-        return self._lines[-n:]
+        if n <= 0:
+            return []
+        lines = list(self._lines)
+        return lines[-n:]
