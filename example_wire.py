@@ -1,73 +1,301 @@
 """
-example_wire.py -- shows how the three layers plug together.
+example_wire.py -- minimal end-to-end wiring example.
 
-This is not a UI. It's the ~30 lines that any real UI (Qt/Textual/web)
-would write once, at startup, to connect networking -> rendering ->
-automation. Run it against a real MUD to see it work end to end:
+Shows how the core layers fit together without introducing a UI toolkit:
 
+    client_core
+        -> ansi_parser
+        -> automation
+        -> terminal output
+
+This is intentionally small. A real Textual, Qt, or web UI follows the
+same ownership boundaries but renders StyledLine objects instead of
+printing their plain text.
+
+Usage:
     python3 example_wire.py mud.example.com 4000
 """
 
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import sys
 
-from client_core import MudConnection, EventBus, EventType
-from ansi_parser import AnsiParser
+from ansi_parser import AnsiParser, StyledLine
 from automation import AutomationEngine
+from client_core import EventBus, EventType, MudConnection
 
 
 async def main(host: str, port: int) -> None:
     bus = EventBus()
     ansi = AnsiParser()
 
-    conn = MudConnection(host, port, bus, terminal_type="PyMudClient")
-    engine = AutomationEngine(send_fn=conn.send_line)
+    conn = MudConnection(
+        host,
+        port,
+        bus,
+        terminal_type="PyMudClient",
+    )
 
-    # example automation, just to prove the wiring works
-    engine.add_alias("k *", "kill %1")
+    engine = AutomationEngine(
+        send_fn=conn.send_line,
+    )
+
+    # ------------------------------------------------------------------
+    # Example automation
+    # ------------------------------------------------------------------
+
+    engine.add_alias(
+        "k *",
+        "kill %1",
+    )
+
     engine.add_trigger(
         r"You are hungry",
-        lambda m, ctx: ctx.send("eat bread"),
+        lambda match, ctx: ctx.send("eat bread"),
         cooldown_s=30,
     )
 
-    def handle_incoming(raw_text: str) -> None:
-        for line in ansi.feed(raw_text):
-            plain = line.plain_text()
-            kept = engine.on_text(plain)
-            if kept is not None:
-                print(kept)  # a real UI would render `line` (with styles), not `kept`
+    # ------------------------------------------------------------------
+    # Incoming line processing
+    # ------------------------------------------------------------------
 
-    bus.on(EventType.TEXT, lambda e: handle_incoming(e.data))
-    bus.on(EventType.PROMPT, lambda e: handle_incoming(e.data))
-    bus.on(EventType.CONNECTED, lambda e: print(f"[connected to {host}:{port}]"))
-    bus.on(EventType.DISCONNECTED, lambda e: print("[disconnected]"))
-    bus.on(EventType.GMCP, lambda e: print(f"[GMCP {e.data['package']}] {e.data['data']}"))
+    def process_line(line: StyledLine) -> None:
+        """
+        One semantic line:
+
+            StyledLine
+                -> plain text for automation
+                -> gag decision
+                -> presentation
+
+        A real UI would render `line` with its styles rather than printing
+        `plain`.
+        """
+
+        plain = line.plain_text()
+
+        kept = engine.on_text(plain)
+
+        if kept is not None:
+            print(plain)
+
+    def handle_text(raw_text: str) -> None:
+        """
+        TEXT events are arbitrary transport chunks.
+
+        Only complete newline-terminated lines returned by AnsiParser are
+        passed to automation.
+        """
+
+        for line in ansi.feed(raw_text):
+            process_line(line)
+
+    def handle_prompt(raw_text: str) -> None:
+        """
+        GA/EOR establishes an authoritative prompt boundary.
+
+        Feed the prompt bytes first, then explicitly flush the parser's
+        unterminated current line.
+        """
+
+        for line in ansi.feed(raw_text):
+            process_line(line)
+
+        prompt = ansi.flush_line()
+
+        if prompt is not None:
+            process_line(prompt)
+
+    def handle_disconnect() -> None:
+        """
+        Preserve any final visible unterminated text before shutdown.
+        """
+
+        final_line = ansi.flush_line()
+
+        if final_line is not None:
+            process_line(final_line)
+
+        print("[disconnected]")
+
+    # ------------------------------------------------------------------
+    # Event wiring
+    # ------------------------------------------------------------------
+
+    bus.on(
+        EventType.TEXT,
+        lambda event: handle_text(event.data),
+    )
+
+    bus.on(
+        EventType.PROMPT,
+        lambda event: handle_prompt(event.data),
+    )
+
+    bus.on(
+        EventType.CONNECTED,
+        lambda event: print(
+            f"[connected to "
+            f"{event.data['host']}:{event.data['port']}]"
+        ),
+    )
+
+    bus.on(
+        EventType.DISCONNECTED,
+        lambda event: handle_disconnect(),
+    )
+
+    bus.on(
+        EventType.GMCP,
+        lambda event: print(
+            f"[GMCP {event.data['package']}] "
+            f"{event.data['data']}"
+        ),
+    )
+
+    bus.on(
+        EventType.MSDP,
+        lambda event: print(
+            f"[MSDP {event.data['variable']}] "
+            f"{event.data['value']}"
+        ),
+    )
+
+    bus.on(
+        EventType.ERROR,
+        lambda event: print(
+            f"[error: {event.data}]"
+        ),
+    )
+
+    # ------------------------------------------------------------------
+    # Connect
+    # ------------------------------------------------------------------
 
     await conn.connect()
 
-    async def ticker():
-        while True:
-            engine.tick()
-            await asyncio.sleep(0.1)
+    # ------------------------------------------------------------------
+    # Periodic automation timer driver
+    # ------------------------------------------------------------------
 
-    tick_task = asyncio.create_task(ticker())
+    async def ticker() -> None:
+        try:
+            while True:
+                engine.tick()
+                await asyncio.sleep(0.1)
 
-    async def stdin_to_server():
-        loop = asyncio.get_event_loop()
+        except asyncio.CancelledError:
+            raise
+
+    # ------------------------------------------------------------------
+    # stdin -> aliases -> network
+    # ------------------------------------------------------------------
+
+    async def stdin_to_server() -> None:
         while True:
-            line = await loop.run_in_executor(None, sys.stdin.readline)
+            line = await asyncio.to_thread(
+                sys.stdin.readline
+            )
+
             if not line:
-                break
-            for cmd in engine.on_command(line.rstrip("\n")):
-                conn.send_line(cmd)
+                return
 
-    await asyncio.gather(conn.wait_closed(), stdin_to_server())
-    tick_task.cancel()
+            # stdin supplies a trailing newline. Strip only line endings rather
+            # than arbitrary whitespace so user-entered spacing is preserved.
+            command = line.rstrip("\r\n")
+
+            for expanded in engine.on_command(command):
+                conn.send_line(expanded)
+
+    ticker_task = asyncio.create_task(
+        ticker(),
+        name="example-wire-ticker",
+    )
+
+    stdin_task = asyncio.create_task(
+        stdin_to_server(),
+        name="example-wire-stdin",
+    )
+
+    connection_task = asyncio.create_task(
+        conn.wait_closed(),
+        name="example-wire-connection",
+    )
+
+    try:
+        # Exit when either:
+        #
+        #   - the MUD disconnects, or
+        #   - stdin closes.
+        #
+        # The original example used gather(), which could remain blocked on
+        # stdin after the network connection had already died.
+        done, pending = await asyncio.wait(
+            {
+                stdin_task,
+                connection_task,
+            },
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Surface unexpected task errors.
+        for task in done:
+            with contextlib.suppress(
+                asyncio.CancelledError
+            ):
+                task.result()
+
+    finally:
+        ticker_task.cancel()
+
+        if not stdin_task.done():
+            stdin_task.cancel()
+
+        if not connection_task.done():
+            connection_task.cancel()
+
+        with contextlib.suppress(Exception):
+            await conn.disconnect()
+
+        await asyncio.gather(
+            ticker_task,
+            stdin_task,
+            connection_task,
+            return_exceptions=True,
+        )
 
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        print("usage: python3 example_wire.py <host> <port>")
+        print(
+            "usage: python3 example_wire.py <host> <port>"
+        )
         sys.exit(1)
-    asyncio.run(main(sys.argv[1], int(sys.argv[2])))
+
+    try:
+        port = int(sys.argv[2])
+
+    except ValueError:
+        print(
+            f"invalid port: {sys.argv[2]!r}"
+        )
+        sys.exit(1)
+
+    if not 1 <= port <= 65535:
+        print(
+            "port must be between 1 and 65535"
+        )
+        sys.exit(1)
+
+    try:
+        asyncio.run(
+            main(
+                sys.argv[1],
+                port,
+            )
+        )
+
+    except KeyboardInterrupt:
+        pass
