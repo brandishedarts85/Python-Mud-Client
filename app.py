@@ -26,13 +26,25 @@ In-app slash commands (typed into the input bar, not sent to the MUD):
     #list                          show current aliases/triggers
     #save                          persist aliases/triggers to automation.json
     #saveprofile NAME               save the current host/port to profiles.json
+    #reconnect                     force an immediate reconnect attempt
+    #disconnect                    disconnect and suspend auto-reconnect
     #help                          show this list
+
+Connection hardening: an unexpected disconnect triggers automatic
+reconnection with exponential backoff (3s, 6s, 12s, ... capped at 60s,
+resetting after a successful reconnect). `#disconnect` suspends that
+until you `#reconnect` (or reconnect yourself with new args). Servers
+that mark prompts with neither GA nor IAC EOR are handled by a
+300ms-idle fallback: if the stream goes quiet with an unterminated
+line buffered, it renders anyway instead of waiting indefinitely for
+a newline that isn't coming.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from dataclasses import dataclass
 
 from rich.style import Style as RichStyle
@@ -129,6 +141,16 @@ class MudClientApp(App):
         ("ctrl+c", "quit", "Quit"),
     ]
 
+    # Reconnect backoff. Class attributes (not constants) so tests can
+    # shrink them without waiting through a real 3-60s backoff.
+    RECONNECT_BASE_DELAY = 3.0
+    RECONNECT_MAX_DELAY = 60.0
+
+    # How long the incoming stream has to sit idle, with an unterminated
+    # line buffered, before we treat it as a prompt anyway. Fallback for
+    # servers that send neither GA nor IAC EOR after a prompt.
+    PROMPT_IDLE_TIMEOUT = 0.3
+
     def __init__(self, host: str | None = None, port: int | None = None) -> None:
         super().__init__()
         self.host = host
@@ -144,6 +166,20 @@ class MudClientApp(App):
         self._history_pos = 0
 
         self._tick_task: asyncio.Task | None = None
+        self._last_text_time: float = 0.0
+
+        # reconnect state
+        self._manual_disconnect = False   # user typed #disconnect
+        self._shutting_down = False       # app itself is closing
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_attempt = 0
+
+        # wired once, here -- NOT in start_connection, which runs again on
+        # every reconnect. These handlers read self.conn/self.engine live
+        # at call time, so a single wiring correctly follows reconnects;
+        # re-wiring on every connect would just keep appending duplicate
+        # handlers to the same persistent EventBus.
+        self._wire_bus()
 
     # -- composition ------------------------------------------------------
 
@@ -164,10 +200,10 @@ class MudClientApp(App):
     # -- connection lifecycle ----------------------------------------------
 
     async def start_connection(self, host: str, port: int) -> None:
+        self.host, self.port = host, port  # remembered for #reconnect / auto-reconnect
         self.conn = MudConnection(host, port, self.bus, terminal_type="PyMudClient")
         self.engine = AutomationEngine(send_fn=self.conn.send_line)
         n_aliases, n_triggers = load_automation(self.engine, DEFAULT_AUTOMATION_PATH)
-        self._wire_bus()
 
         self._set_status(f"connecting to {host}:{port}...")
         try:
@@ -175,7 +211,10 @@ class MudClientApp(App):
         except OSError as exc:
             self._write_system_line(f"[connection failed: {exc}]")
             self._set_status("disconnected")
+            self._schedule_reconnect()
             return
+
+        self._reconnect_attempt = 0  # reset backoff after a successful connect
 
         if n_aliases or n_triggers:
             self._write_system_line(
@@ -185,6 +224,27 @@ class MudClientApp(App):
 
         if self._tick_task is None:
             self._tick_task = asyncio.create_task(self._tick_loop())
+
+    def _schedule_reconnect(self) -> None:
+        if self._manual_disconnect or self._shutting_down:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return  # already have one pending
+        delay = min(
+            self.RECONNECT_BASE_DELAY * (2 ** self._reconnect_attempt),
+            self.RECONNECT_MAX_DELAY,
+        )
+        self._reconnect_attempt += 1
+        self._write_system_line(f"[reconnecting in {delay:.0f}s...]")
+        self._reconnect_task = asyncio.create_task(self._reconnect_after(delay))
+
+    async def _reconnect_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if self._manual_disconnect or self._shutting_down:
+            return
+        if self.host and self.port:
+            self._write_system_line(f"[reconnecting to {self.host}:{self.port}...]")
+            await self.start_connection(self.host, self.port)
 
     def _wire_bus(self) -> None:
         self.bus.on(EventType.TEXT, lambda e: self._on_incoming(e.data, is_prompt=False))
@@ -200,6 +260,7 @@ class MudClientApp(App):
     def _on_disconnected(self) -> None:
         self._set_status("disconnected")
         self._write_system_line("[disconnected]")
+        self._schedule_reconnect()
 
     def _on_gmcp(self, data) -> None:
         if data.get("package") == "Char.Vitals" and isinstance(data.get("data"), dict):
@@ -210,6 +271,7 @@ class MudClientApp(App):
                 self._set_status(f"connected  |  HP {hp}/{maxhp}")
 
     def _on_incoming(self, raw_text: str, is_prompt: bool = False) -> None:
+        self._last_text_time = time.monotonic()
         lines = self.ansi.feed(raw_text)
         if is_prompt:
             # a GA/EOR-marked prompt never ends in \r\n, so ansi.feed()
@@ -245,7 +307,32 @@ class MudClientApp(App):
         while True:
             if self.engine:
                 self.engine.tick()
+            self._check_prompt_idle_timeout()
             await asyncio.sleep(0.1)
+
+    def _check_prompt_idle_timeout(self) -> None:
+        """Fallback for servers that mark prompts with neither GA nor
+        IAC EOR (some old or minimal codebases just... don't). If the
+        stream goes quiet for PROMPT_IDLE_TIMEOUT with an unterminated
+        line sitting in the ANSI parser's buffer, render it anyway
+        rather than leaving it stuck until more data happens to arrive."""
+        if self._last_text_time == 0.0:
+            return  # nothing has arrived yet
+        idle_for = time.monotonic() - self._last_text_time
+        if idle_for < self.PROMPT_IDLE_TIMEOUT:
+            return
+        flushed = self.ansi.flush_line()
+        if flushed is None:
+            return
+        self._last_text_time = 0.0  # don't re-trigger until new text arrives
+        self.scrollback.append(flushed)
+        plain = flushed.plain_text()
+        kept = self.engine.on_text(plain) if self.engine else plain
+        if kept is not None:
+            try:
+                self.query_one("#output", RichLog).write(line_to_rich_text(flushed))
+            except NoMatches:
+                pass
 
     # -- input handling ------------------------------------------------
 
@@ -356,14 +443,45 @@ class MudClientApp(App):
                 save_profile(name, self.conn.host, self.conn.port)
                 self._write_system_line(f"[saved profile {name!r} -> {self.conn.host}:{self.conn.port}]")
 
+        elif cmd == "reconnect":
+            if self._reconnect_task and not self._reconnect_task.done():
+                self._reconnect_task.cancel()
+            self._reconnect_attempt = 0
+            if not self.host or not self.port:
+                self._write_system_line("[no previous connection to reconnect to]")
+            else:
+                asyncio.create_task(self._manual_reconnect())
+                self._write_system_line(f"[reconnecting to {self.host}:{self.port}...]")
+
+        elif cmd == "disconnect":
+            self._manual_disconnect = True
+            if self._reconnect_task and not self._reconnect_task.done():
+                self._reconnect_task.cancel()
+            if self.conn:
+                asyncio.create_task(self.conn.disconnect())
+                self._write_system_line("[disconnected by user -- use #reconnect to reconnect]")
+            else:
+                self._write_system_line("[not connected]")
+
         elif cmd == "help" or cmd == "":
             self._write_system_line(
                 "[commands: #alias P = E | #unalias P | #trigger P = R [:: gag oneshot "
-                "cooldown=N] | #untrigger P | #list | #save | #saveprofile NAME]"
+                "cooldown=N] | #untrigger P | #list | #save | #saveprofile NAME | "
+                "#reconnect | #disconnect]"
             )
 
         else:
             self._write_system_line(f"[unknown command: #{cmd} -- try #help]")
+
+    async def _manual_reconnect(self) -> None:
+        # suppress the auto-schedule that _on_disconnected() would
+        # otherwise fire from the disconnect() below -- we're about to
+        # reconnect ourselves, immediately, not on a backoff timer.
+        self._manual_disconnect = True
+        if self.conn:
+            await self.conn.disconnect()
+        self._manual_disconnect = False
+        await self.start_connection(self.host, self.port)
 
     @staticmethod
     def _remove_by_pattern(store: dict, pattern: str) -> int:
@@ -390,6 +508,9 @@ class MudClientApp(App):
             event.stop()
 
     async def on_unmount(self) -> None:
+        self._shutting_down = True
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
         if self._tick_task:
             self._tick_task.cancel()
         if self.conn:

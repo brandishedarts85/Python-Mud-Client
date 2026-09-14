@@ -48,10 +48,20 @@ MSDP) — nothing derived from GMud32's source or binary.
   In-app slash commands (typed into the input bar, never sent to the
   MUD): `#alias P = E`, `#unalias P`, `#trigger P = R [:: gag]
   [oneshot] [cooldown=N]`, `#untrigger P`, `#list`, `#save`,
-  `#saveprofile NAME`, `#help`. Only "simple" aliases/triggers (a
-  plain response string, not an arbitrary Python callable) round-trip
-  through the JSON files — code-defined automation from
-  `example_wire.py`-style scripts stays in code, by design.
+  `#saveprofile NAME`, `#reconnect`, `#disconnect`, `#help`. Only
+  "simple" aliases/triggers (a plain response string, not an arbitrary
+  Python callable) round-trip through the JSON files — code-defined
+  automation from `example_wire.py`-style scripts stays in code, by
+  design.
+- **Connection hardening**, also in `app.py`: an unexpected disconnect
+  triggers automatic reconnection with exponential backoff (3s, 6s,
+  12s, ... capped at 60s; resets to 3s after a successful reconnect).
+  `#disconnect` suspends that until `#reconnect` or a fresh connect.
+  Servers that mark prompts with *neither* GA nor IAC EOR (some old or
+  minimal codebases just don't bother) are handled by a 300ms-idle
+  fallback: if the stream goes quiet with an unterminated line still
+  buffered, it renders anyway rather than waiting indefinitely for a
+  newline that was never coming.
 
 ## What's been verified (not just written — actually run)
 
@@ -97,6 +107,19 @@ MSDP) — nothing derived from GMud32's source or binary.
   full slash-command flow (`#alias`, `#trigger`, `#list`, `#save`,
   `#saveprofile`, removal) driven through Textual's `run_test()` pilot
   end-to-end.
+- **Reconnect/idle-timeout hardening**: an unexpected drop reconnects
+  automatically and re-renders correctly with no duplicated output;
+  `#disconnect` genuinely suspends auto-reconnect and `#reconnect`
+  restores it; a GA/EOR-less prompt renders after the idle window
+  without fragmenting normal fast multi-chunk text that happens to
+  arrive in quick succession. Building this surfaced one real bug
+  worth remembering: `_wire_bus()` was being called again on every
+  reconnect, silently appending duplicate handlers to the same
+  long-lived `EventBus` and causing every event to fire (and render)
+  once per accumulated handler after the first reconnect. Fixed by
+  wiring the bus exactly once, in `__init__`, since its handlers read
+  `self.conn`/`self.engine` live rather than capturing them at wiring
+  time — so a single wiring correctly follows every future reconnect.
 
 Run `python3 -m py_compile *.py` to sanity check, or point
 `example_wire.py` at a real MUD to see it end to end.
