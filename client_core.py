@@ -38,14 +38,19 @@ Protocol rule:
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
 import ssl
+import time
 import zlib
 
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Callable, Optional
+
+from lifecycle import Subscription
 
 
 logger = logging.getLogger("mudclient.core")
@@ -103,9 +108,25 @@ MSDP_ARRAY_CLOSE = 6
 
 # Defensive protocol limits.
 MAX_SUBNEGOTIATION_BYTES = 1024 * 1024
+# Option-specific ceilings let us reject oversized known protocol payloads
+# before the generic Telnet SB buffer reaches its much larger fallback limit.
+MAX_TTYPE_BYTES = 4 * 1024
+MAX_MCCP2_NEGOTIATION_BYTES = 4 * 1024
+MAX_GMCP_BYTES = 256 * 1024
+MAX_MSDP_BYTES = 256 * 1024
 MAX_PENDING_TEXT_BYTES = 1024 * 1024
-MAX_GMCP_BYTES = 1024 * 1024
-MAX_MSDP_BYTES = 1024 * 1024
+MAX_MSDP_NESTING = 64
+# Maximum decompressed MCCP2 output accepted from one socket read.
+# The +1 sentinel used at the call site lets us detect overflow without ever
+# allowing zlib to materialize an unbounded expansion in memory.
+MAX_MCCP_OUTPUT_PER_READ = 1024 * 1024
+
+# Repeated Telnet negotiation can otherwise become a CPU/write amplifier when
+# a broken or hostile peer loops WILL/WONT/DO/DONT. Normal setup uses only a
+# handful of transitions per option, so this budget is intentionally generous.
+NEGOTIATION_CHURN_WINDOW_SECONDS = 5.0
+MAX_NEGOTIATIONS_PER_OPTION_WINDOW = 24
+NEGOTIATION_CHURN_SUPPRESS_SECONDS = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +148,10 @@ class EventType(Enum):
     PROMPT = auto()
 
     OPTION_CHANGE = auto()
+
+    # Diagnostic-only protocol event. It must not masquerade as option state.
+    PROTOCOL_NOTICE = auto()
+
     ERROR = auto()
 
 
@@ -154,7 +179,7 @@ class EventBus:
         self,
         event_type: EventType,
         handler: Callable[[Event], None],
-    ) -> None:
+    ) -> Subscription:
         handlers = self._subs.setdefault(
             event_type,
             [],
@@ -162,6 +187,8 @@ class EventBus:
 
         if handler not in handlers:
             handlers.append(handler)
+
+        return Subscription(lambda: self.off(event_type, handler))
 
     def off(
         self,
@@ -241,6 +268,25 @@ class TelnetProtocolError(RuntimeError):
     """Raised when Telnet framing becomes unsafe to continue parsing."""
 
 
+def _subnegotiation_limit(option: Optional[int]) -> int:
+    """Return the maximum payload retained for one Telnet SB frame.
+
+    Unknown options use the generic ceiling.  Known protocols use tighter
+    bounds so a hostile peer cannot force the client to retain a full generic
+    megabyte before the option-specific handler gets a chance to reject it.
+    """
+
+    if option == OPT_TTYPE:
+        return MAX_TTYPE_BYTES
+    if option == OPT_MCCP2:
+        return MAX_MCCP2_NEGOTIATION_BYTES
+    if option == OPT_GMCP:
+        return MAX_GMCP_BYTES
+    if option == OPT_MSDP:
+        return MAX_MSDP_BYTES
+    return MAX_SUBNEGOTIATION_BYTES
+
+
 # ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
@@ -274,7 +320,7 @@ class MudConnection:
         port: int,
         bus: EventBus,
         use_tls: bool = False,
-        terminal_type: str = "MudClient",
+        terminal_type: str = "xterm-256color",
         encoding: str = "utf-8",
     ) -> None:
         self.host = host
@@ -314,6 +360,12 @@ class MudConnection:
         self._local_options: set[int] = set()
 
         self.options_enabled: set[int] = set()
+
+        # Negotiation-churn accounting is per option. Telnet option bytes are
+        # inherently bounded to 0..255, and each deque is pruned to a short
+        # monotonic-time window.
+        self._negotiation_times: dict[int, deque[float]] = {}
+        self._negotiation_suppressed_until: dict[int, float] = {}
 
         # ------------------------------------------------------------------
         # Telnet parser state
@@ -406,6 +458,8 @@ class MudConnection:
 
         DISCONNECTED is emitted at most once regardless of whether shutdown was
         initiated locally, by EOF, by cancellation, or by a read-loop error.
+        Cleanup is guaranteed even if the *caller* of disconnect() is itself
+        cancelled while waiting for the socket/read task to finish.
         """
 
         if self._disconnecting:
@@ -415,49 +469,50 @@ class MudConnection:
 
         read_task = self._read_task
         writer = self._writer
-
         current_task = asyncio.current_task()
 
-        if (
-            read_task is not None
-            and not read_task.done()
-            and read_task is not current_task
-        ):
-            read_task.cancel()
+        try:
+            if (
+                read_task is not None
+                and not read_task.done()
+                and read_task is not current_task
+            ):
+                read_task.cancel()
 
-        if writer is not None:
-            writer.close()
+            if writer is not None:
+                writer.close()
 
-            try:
-                await writer.wait_closed()
+                try:
+                    await writer.wait_closed()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Transport shutdown failure should not prevent lifecycle
+                    # completion.
+                    pass
 
-            except Exception:
-                # Transport shutdown failure should not prevent lifecycle
-                # completion.
-                pass
-
-        if (
-            read_task is not None
-            and read_task is not current_task
-            and not read_task.done()
-        ):
-            try:
-                await read_task
-
-            except asyncio.CancelledError:
-                pass
-
-            except Exception:
-                # _read_loop already reports transport failures.
-                pass
-
-        self._reader = None
-        self._writer = None
-        self._read_task = None
-
-        self._emit_disconnected_once()
-
-        self._disconnecting = False
+            if (
+                read_task is not None
+                and read_task is not current_task
+                and not read_task.done()
+            ):
+                try:
+                    await read_task
+                except asyncio.CancelledError:
+                    # Cancellation of the read task is expected during normal
+                    # local shutdown.  If *this* disconnect task was cancelled,
+                    # that cancellation has already propagated from an earlier
+                    # await and the outer finally still performs cleanup.
+                    pass
+                except Exception:
+                    # _read_loop already reports transport failures.
+                    pass
+        finally:
+            self._reader = None
+            self._writer = None
+            self._read_task = None
+            self._emit_disconnected_once()
+            self._disconnecting = False
 
     async def wait_closed(self) -> None:
         task = self._read_task
@@ -481,6 +536,8 @@ class MudConnection:
         self._remote_options.clear()
         self._local_options.clear()
         self.options_enabled.clear()
+        self._negotiation_times.clear()
+        self._negotiation_suppressed_until.clear()
 
         self._mccp_active = False
         self._decompressor = None
@@ -837,8 +894,13 @@ class MudConnection:
             self._raw_queue.clear()
 
             try:
+                # Bound output *inside* zlib.  Checking len() only after an
+                # unbounded decompress would be too late for a decompression
+                # bomb.  Request one byte beyond the configured budget as a
+                # sentinel; if zlib can produce it, reject the stream.
                 decompressed = decompressor.decompress(
-                    compressed
+                    compressed,
+                    MAX_MCCP_OUTPUT_PER_READ + 1,
                 )
 
             except zlib.error as exc:
@@ -846,6 +908,11 @@ class MudConnection:
                 raise TelnetProtocolError(
                     f"MCCP2 decompression failed: {exc}"
                 ) from exc
+
+            if len(decompressed) > MAX_MCCP_OUTPUT_PER_READ:
+                raise TelnetProtocolError(
+                    "MCCP2 decompressed output exceeds configured per-read limit"
+                )
 
             if decompressed:
                 consumed = self._feed(
@@ -880,6 +947,15 @@ class MudConnection:
     # ------------------------------------------------------------------
     # Telnet state machine
     # ------------------------------------------------------------------
+
+    def _check_subnegotiation_size(self) -> None:
+        limit = _subnegotiation_limit(self._sb_option)
+        if len(self._sb_buffer) > limit:
+            option = self._sb_option
+            raise TelnetProtocolError(
+                f"Telnet subnegotiation for option {option} exceeds "
+                f"configured limit of {limit} bytes"
+            )
 
     def _feed(
         self,
@@ -1048,15 +1124,7 @@ class MudConnection:
                         byte
                     )
 
-                    if (
-                        len(
-                            self._sb_buffer
-                        )
-                        > MAX_SUBNEGOTIATION_BYTES
-                    ):
-                        raise TelnetProtocolError(
-                            "Telnet subnegotiation exceeds configured limit"
-                        )
+                    self._check_subnegotiation_size()
 
             elif state == _TelnetState.SUBNEG_IAC:
                 if byte == SE:
@@ -1101,15 +1169,7 @@ class MudConnection:
                         _TelnetState.SUBNEG
                     )
 
-                if (
-                    len(
-                        self._sb_buffer
-                    )
-                    > MAX_SUBNEGOTIATION_BYTES
-                ):
-                    raise TelnetProtocolError(
-                        "Telnet subnegotiation exceeds configured limit"
-                    )
+                self._check_subnegotiation_size()
 
             # ----------------------------------------------------------
             # MCCP transition
@@ -1219,6 +1279,9 @@ class MudConnection:
             option,
         )
 
+        if not self._negotiation_allowed(command, option):
+            return
+
         # --------------------------------------------------------------
         # Server WILL option
         # --------------------------------------------------------------
@@ -1234,39 +1297,21 @@ class MudConnection:
             }
 
             if accepted:
-                newly_enabled = (
-                    option
-                    not in self._remote_options
-                )
-
-                self._remote_options.add(
-                    option
-                )
-
+                newly_enabled = option not in self._remote_options
+                self._remote_options.add(option)
                 self._refresh_enabled_options()
 
-                self._send_telnet_command(
-                    IAC,
-                    DO,
-                    option,
-                )
-
+                # Telnet negotiation is state-based. Re-acknowledging a WILL
+                # for an option already enabled can itself sustain a WILL/DO
+                # loop, so acknowledge only the transition into enabled.
                 if newly_enabled:
+                    self._send_telnet_command(IAC, DO, option)
                     self.bus.emit(
                         EventType.OPTION_CHANGE,
-                        {
-                            "option": option,
-                            "state": "will",
-                        },
+                        {"option": option, "state": "will"},
                     )
-
             else:
-                self._send_telnet_command(
-                    IAC,
-                    DONT,
-                    option,
-                )
-
+                self._send_telnet_command(IAC, DONT, option)
             return
 
         # --------------------------------------------------------------
@@ -1274,15 +1319,8 @@ class MudConnection:
         # --------------------------------------------------------------
 
         if command == WONT:
-            changed = (
-                option
-                in self._remote_options
-            )
-
-            self._remote_options.discard(
-                option
-            )
-
+            changed = option in self._remote_options
+            self._remote_options.discard(option)
             self._refresh_enabled_options()
 
             if option == OPT_MCCP2:
@@ -1292,12 +1330,8 @@ class MudConnection:
             if changed:
                 self.bus.emit(
                     EventType.OPTION_CHANGE,
-                    {
-                        "option": option,
-                        "state": "wont",
-                    },
+                    {"option": option, "state": "wont"},
                 )
-
             return
 
         # --------------------------------------------------------------
@@ -1305,104 +1339,22 @@ class MudConnection:
         # --------------------------------------------------------------
 
         if command == DO:
-            if option == OPT_TTYPE:
-                newly_enabled = (
-                    option
-                    not in self._local_options
-                )
-
-                self._local_options.add(
-                    option
-                )
-
+            if option in {OPT_TTYPE, OPT_NAWS, OPT_SGA}:
+                newly_enabled = option not in self._local_options
+                self._local_options.add(option)
                 self._refresh_enabled_options()
 
-                self._send_telnet_command(
-                    IAC,
-                    WILL,
-                    option,
-                )
-
                 if newly_enabled:
+                    self._send_telnet_command(IAC, WILL, option)
+                    if option == OPT_NAWS:
+                        self.send_naws(self.cols, self.rows)
                     self.bus.emit(
                         EventType.OPTION_CHANGE,
-                        {
-                            "option": option,
-                            "state": "do",
-                        },
+                        {"option": option, "state": "do"},
                     )
-
                 return
 
-            if option == OPT_NAWS:
-                newly_enabled = (
-                    option
-                    not in self._local_options
-                )
-
-                self._local_options.add(
-                    option
-                )
-
-                self._refresh_enabled_options()
-
-                self._send_telnet_command(
-                    IAC,
-                    WILL,
-                    option,
-                )
-
-                self.send_naws(
-                    self.cols,
-                    self.rows,
-                )
-
-                if newly_enabled:
-                    self.bus.emit(
-                        EventType.OPTION_CHANGE,
-                        {
-                            "option": option,
-                            "state": "do",
-                        },
-                    )
-
-                return
-
-            if option == OPT_SGA:
-                newly_enabled = (
-                    option
-                    not in self._local_options
-                )
-
-                self._local_options.add(
-                    option
-                )
-
-                self._refresh_enabled_options()
-
-                self._send_telnet_command(
-                    IAC,
-                    WILL,
-                    option,
-                )
-
-                if newly_enabled:
-                    self.bus.emit(
-                        EventType.OPTION_CHANGE,
-                        {
-                            "option": option,
-                            "state": "do",
-                        },
-                    )
-
-                return
-
-            self._send_telnet_command(
-                IAC,
-                WONT,
-                option,
-            )
-
+            self._send_telnet_command(IAC, WONT, option)
             return
 
         # --------------------------------------------------------------
@@ -1410,25 +1362,68 @@ class MudConnection:
         # --------------------------------------------------------------
 
         if command == DONT:
-            changed = (
-                option
-                in self._local_options
-            )
-
-            self._local_options.discard(
-                option
-            )
-
+            changed = option in self._local_options
+            self._local_options.discard(option)
             self._refresh_enabled_options()
 
             if changed:
                 self.bus.emit(
                     EventType.OPTION_CHANGE,
-                    {
-                        "option": option,
-                        "state": "dont",
-                    },
+                    {"option": option, "state": "dont"},
                 )
+
+    def _negotiation_allowed(
+        self,
+        command: int,
+        option: int,
+    ) -> bool:
+        """Bound pathological negotiation churn without blocking the session.
+
+        The first messages in a generous rolling window are handled normally.
+        Once a peer exceeds that budget, negotiation for only that option is
+        ignored for a short cooling-off period; ordinary text and other Telnet
+        options continue flowing. A single diagnostic notice is emitted when
+        suppression starts.
+        """
+
+        now = time.monotonic()
+        suppressed_until = self._negotiation_suppressed_until.get(option, 0.0)
+
+        if suppressed_until > now:
+            return False
+
+        if suppressed_until:
+            self._negotiation_suppressed_until.pop(option, None)
+            self._negotiation_times.pop(option, None)
+
+        history = self._negotiation_times.setdefault(option, deque())
+        cutoff = now - NEGOTIATION_CHURN_WINDOW_SECONDS
+        while history and history[0] < cutoff:
+            history.popleft()
+        history.append(now)
+
+        if len(history) <= MAX_NEGOTIATIONS_PER_OPTION_WINDOW:
+            return True
+
+        self._negotiation_suppressed_until[option] = (
+            now + NEGOTIATION_CHURN_SUPPRESS_SECONDS
+        )
+
+        notice = {
+            "kind": "negotiation-churn",
+            "option": option,
+            "command": _CMD_NAMES.get(command, str(command)),
+            "count": len(history),
+            "window_seconds": NEGOTIATION_CHURN_WINDOW_SECONDS,
+            "suppressed_seconds": NEGOTIATION_CHURN_SUPPRESS_SECONDS,
+        }
+        self.bus.emit(EventType.PROTOCOL_NOTICE, notice)
+        logger.warning(
+            "suppressing Telnet negotiation churn for option %d for %.1fs",
+            option,
+            NEGOTIATION_CHURN_SUPPRESS_SECONDS,
+        )
+        return False
 
     def _refresh_enabled_options(
         self,
@@ -1557,14 +1552,42 @@ class MudConnection:
                 " "
             )
 
-            try:
-                data = json.loads(
-                    json_part
-                )
+            max_depth = 0
+            depth = 0
+            in_string = False
+            escaped = False
+            for char in json_part:
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                    continue
 
-            except json.JSONDecodeError:
-                # Some MUDs emit non-JSON GMCP values. Preserve them as text
-                # rather than dropping the message.
+                if char == '"':
+                    in_string = True
+                    continue
+
+                if char in "[{":
+                    depth += 1
+                    if depth > max_depth:
+                        max_depth = depth
+                elif char in "]}":
+                    depth = max(0, depth - 1)
+
+            try:
+                if max_depth > 1024:
+                    raise ValueError("GMCP JSON nesting too deep")
+                data = json.loads(json_part)
+
+            except (json.JSONDecodeError, RecursionError, ValueError):
+                # Some MUDs emit non-JSON GMCP values.  Pathologically deep
+                # JSON can also produce an enormous nested Python structure
+                # or overflow the decoder before returning.  Preserve either
+                # form as bounded text rather than letting one remote message
+                # tear down the read loop.
                 data = json_part
 
         else:
@@ -1662,72 +1685,39 @@ def _decode_text_prefix(
     data: bytes,
     encoding: str,
 ) -> tuple[str, int]:
-    """
-    Decode all safely consumable bytes.
+    """Decode all bytes that are safe to consume now.
 
-    Only a trailing incomplete multibyte sequence is retained.
+    The incremental codec is used with ``errors="replace"`` so malformed
+    *complete* byte sequences can never wedge the receive buffer, while a
+    trailing incomplete multibyte character remains buffered for the next
+    socket read.  This distinction matters when malformed bytes occur *before*
+    a valid character split across reads: replacing the malformed byte must
+    not force replacement of the incomplete trailing character too.
 
-    Complete malformed byte sequences are consumed with replacement instead
-    of being left at the front of the buffer forever.
-
-    Example:
-
-        valid text + incomplete UTF-8 character
-            -> emit valid text
-            -> retain incomplete suffix
-
-        valid text + invalid byte + more valid text
-            -> emit using replacement character
-            -> consume all bytes
+    The returned integer is the number of input bytes consumed.
     """
 
     if not data:
         return "", 0
 
-    try:
-        return (
-            data.decode(
-                encoding,
-                errors="strict",
-            ),
-            len(data),
-        )
+    decoder_factory = codecs.getincrementaldecoder(encoding)
+    decoder = decoder_factory(errors="replace")
+    text = decoder.decode(data, final=False)
 
-    except UnicodeDecodeError as exc:
-        # Only preserve a suffix when the decoder explicitly reports that the
-        # sequence ended prematurely at the END of the available data.
-        incomplete_tail = (
-            exc.end == len(data)
-            and (
-                "unexpected end"
-                in exc.reason.lower()
-                or "truncated"
-                in exc.reason.lower()
-            )
-        )
+    state = decoder.getstate()
+    pending = state[0] if isinstance(state, tuple) and state else b""
+    if not isinstance(pending, (bytes, bytearray)):
+        # Python's standard incremental byte decoders expose pending bytes as
+        # state[0].  A third-party codec with a different state shape should
+        # fail safe by consuming what it already decoded rather than retaining
+        # an unknowable amount of input forever.
+        pending = b""
 
-        if incomplete_tail:
-            prefix = data[
-                :exc.start
-            ]
+    consumed = len(data) - len(pending)
+    if consumed < 0 or consumed > len(data):
+        consumed = len(data)
 
-            return (
-                prefix.decode(
-                    encoding,
-                    errors="replace",
-                ),
-                exc.start,
-            )
-
-        # An invalid complete byte sequence cannot be repaired by receiving
-        # more network data later. Replace it and make forward progress.
-        return (
-            data.decode(
-                encoding,
-                errors="replace",
-            ),
-            len(data),
-        )
+    return text, consumed
 
 
 # ---------------------------------------------------------------------------
@@ -1776,8 +1766,13 @@ def _parse_msdp(
             errors="replace",
         )
 
-    def parse_value() -> Any:
+    def parse_value(depth: int = 0) -> Any:
         nonlocal position
+
+        if depth > MAX_MSDP_NESTING:
+            raise ValueError(
+                f"MSDP nesting exceeds configured limit of {MAX_MSDP_NESTING}"
+            )
 
         if position >= length:
             return ""
@@ -1810,7 +1805,7 @@ def _parse_msdp(
                         break
 
                 items.append(
-                    parse_value()
+                    parse_value(depth + 1)
                 )
 
             if (
@@ -1870,7 +1865,7 @@ def _parse_msdp(
                 position += 1
 
                 table[name] = (
-                    parse_value()
+                    parse_value(depth + 1)
                 )
 
             if (

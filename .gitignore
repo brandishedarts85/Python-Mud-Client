@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+profiles.json
+automation.json
+macros.json
+*.log
+.DS_Store
+Thumbs.db
+
+profiles_data/

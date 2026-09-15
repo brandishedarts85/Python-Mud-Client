@@ -38,7 +38,9 @@ import time
 import uuid
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
+
+from ansi_parser import Style, StyledLine
 
 
 logger = logging.getLogger("mudclient.automation")
@@ -230,6 +232,147 @@ class Alias:
 # ---------------------------------------------------------------------------
 
 
+RGB = tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class TriggerStyleFilter:
+    """Optional visual-style constraints for an incoming-text trigger.
+
+    Colors are stored as normalized RGB triples so the same matcher works for
+    classic ANSI 16-color, xterm-256, and truecolor output after parsing.
+
+    A None attribute means "ignore this attribute".  Foreground/background
+    tuples are OR-lists: an empty tuple means "ignore this color channel".
+    """
+
+    foregrounds: tuple[RGB, ...] = ()
+    backgrounds: tuple[RGB, ...] = ()
+    allow_default_foreground: bool = False
+    allow_default_background: bool = False
+    bold: Optional[bool] = None
+    dim: Optional[bool] = None
+    italic: Optional[bool] = None
+    underline: Optional[bool] = None
+    blink: Optional[bool] = None
+    strike: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        for name, colors in (("foregrounds", self.foregrounds), ("backgrounds", self.backgrounds)):
+            normalized: list[RGB] = []
+            for color in colors:
+                if len(color) != 3 or any(not isinstance(v, int) or not 0 <= v <= 255 for v in color):
+                    raise ValueError(f"{name}: colors must be RGB triples in the range 0..255")
+                rgb = (int(color[0]), int(color[1]), int(color[2]))
+                if rgb not in normalized:
+                    normalized.append(rgb)
+            object.__setattr__(self, name, tuple(normalized))
+
+    @property
+    def active(self) -> bool:
+        return bool(
+            self.foregrounds
+            or self.backgrounds
+            or self.allow_default_foreground
+            or self.allow_default_background
+            or any(
+                value is not None
+                for value in (
+                    self.bold, self.dim, self.italic, self.underline,
+                    self.blink, self.strike,
+                )
+            )
+        )
+
+    def matches_style(self, style: Style) -> bool:
+        # Match the colors the player actually sees.  ANSI reverse swaps the
+        # semantic foreground/background at presentation time.
+        fg, bg = style.fg, style.bg
+        if style.reverse:
+            fg, bg = bg, fg
+
+        foreground_restricted = bool(self.foregrounds or self.allow_default_foreground)
+        if foreground_restricted:
+            if fg is None:
+                if not self.allow_default_foreground:
+                    return False
+            elif fg not in self.foregrounds:
+                return False
+
+        background_restricted = bool(self.backgrounds or self.allow_default_background)
+        if background_restricted:
+            if bg is None:
+                if not self.allow_default_background:
+                    return False
+            elif bg not in self.backgrounds:
+                return False
+
+        for name in ("bold", "dim", "italic", "underline", "blink", "strike"):
+            expected = getattr(self, name)
+            if expected is not None and bool(getattr(style, name)) != expected:
+                return False
+        return True
+
+    def matches_span(self, line: StyledLine, start: int, end: int) -> bool:
+        """Return True when every non-whitespace character in a match span
+        satisfies the filter.
+
+        Requiring the style across the actual regex match prevents a chat line
+        containing the same words in another color from spoofing a color-aware
+        trigger.  Whitespace is ignored because many MUDs reset style around
+        padding/indentation.
+        """
+
+        if not self.active:
+            return True
+        if start >= end:
+            return False
+
+        offset = 0
+        saw_visible = False
+        for segment in line.segments:
+            seg_start = offset
+            seg_end = offset + len(segment.text)
+            offset = seg_end
+            overlap_start = max(start, seg_start)
+            overlap_end = min(end, seg_end)
+            if overlap_start >= overlap_end:
+                continue
+            text = segment.text[overlap_start - seg_start:overlap_end - seg_start]
+            if not any(not ch.isspace() for ch in text):
+                continue
+            saw_visible = True
+            if not self.matches_style(segment.style):
+                return False
+        return saw_visible
+
+
+@dataclass(frozen=True)
+class TriggerFireEvent:
+    trigger_id: str
+    pattern: str
+    line: str
+    matched_text: str
+    response: Optional[str]
+    fired_at: float
+
+
+@dataclass(frozen=True)
+class TriggerTestResult:
+    trigger_id: str
+    pattern: str
+    master_enabled: bool
+    trigger_enabled: bool
+    regex_matched: bool
+    style_required: bool
+    style_available: bool
+    style_matched: Optional[bool]
+    cooldown_ready: bool
+    would_fire: bool
+    matched_text: str = ""
+    reason: str = ""
+
+
 @dataclass
 class Trigger:
     id: str
@@ -255,9 +398,16 @@ class Trigger:
 
     case_sensitive: bool = False
 
+    # Higher priority triggers are evaluated first. Equal priorities preserve
+    # insertion order, which keeps existing automation deterministic.
+    priority: int = 0
+
     # Present only for persistence-safe template triggers.
     # None means this is a code-defined runtime action.
     response_template: Optional[str] = None
+
+    # Optional parsed-ANSI constraints for this trigger.
+    style_filter: Optional[TriggerStyleFilter] = None
 
     _regex: re.Pattern[str] = field(
         init=False,
@@ -291,6 +441,7 @@ class Trigger:
         self,
         line: str,
         *,
+        styled_line: Optional[StyledLine] = None,
         now: Optional[float] = None,
     ) -> Optional[re.Match[str]]:
         if not self.enabled:
@@ -310,9 +461,17 @@ class Trigger:
         ):
             return None
 
-        return self._regex.search(
-            line
-        )
+        match = self._regex.search(line)
+        if match is None:
+            return None
+
+        if self.style_filter is not None and self.style_filter.active:
+            if styled_line is None:
+                return None
+            if not self.style_filter.matches_span(styled_line, match.start(), match.end()):
+                return None
+
+        return match
 
     def fire(
         self,
@@ -358,6 +517,7 @@ class TriggerContext:
     line: str
     send: SendFn
     engine: "AutomationEngine"
+    styled_line: Optional[StyledLine] = None
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +679,7 @@ class AutomationEngine:
         send_fn: SendFn,
     ) -> None:
         self.send = send_fn
+        self.enabled = True
 
         self.triggers: dict[
             str,
@@ -539,9 +700,12 @@ class AutomationEngine:
             EventHook
         ] = []
 
+        self._trigger_fire_hooks: list[Callable[[TriggerFireEvent], None]] = []
+
         # attach() exists for compatibility/convenience. Track buses so
         # accidental repeated attachment does not duplicate event delivery.
         self._attached_bus_ids: set[int] = set()
+        self._attached_bus_subscriptions: dict[int, list[Any]] = {}
 
     # ------------------------------------------------------------------
     # Registration
@@ -559,6 +723,8 @@ class AutomationEngine:
         one_shot: bool = False,
         cooldown_s: float = 0.0,
         case_sensitive: bool = False,
+        priority: int = 0,
+        style_filter: Optional[TriggerStyleFilter] = None,
         trigger_id: Optional[str] = None,
     ) -> str:
         cooldown_s = _validate_nonnegative_seconds(
@@ -583,6 +749,8 @@ class AutomationEngine:
             one_shot=one_shot,
             cooldown_s=cooldown_s,
             case_sensitive=case_sensitive,
+            priority=int(priority),
+            style_filter=style_filter,
         )
 
         return trigger_id
@@ -596,6 +764,8 @@ class AutomationEngine:
         one_shot: bool = False,
         cooldown_s: float = 0.0,
         case_sensitive: bool = False,
+        priority: int = 0,
+        style_filter: Optional[TriggerStyleFilter] = None,
         trigger_id: Optional[str] = None,
     ) -> str:
         """
@@ -652,7 +822,9 @@ class AutomationEngine:
             one_shot=one_shot,
             cooldown_s=cooldown_s,
             case_sensitive=case_sensitive,
+            priority=int(priority),
             response_template=response,
+            style_filter=style_filter,
         )
 
         return trigger_id
@@ -758,6 +930,102 @@ class AutomationEngine:
     # Enable / disable / removal
     # ------------------------------------------------------------------
 
+    def add_trigger_fire_hook(
+        self,
+        hook: Callable[[TriggerFireEvent], None],
+    ) -> None:
+        if hook not in self._trigger_fire_hooks:
+            self._trigger_fire_hooks.append(hook)
+
+    def remove_trigger_fire_hook(
+        self,
+        hook: Callable[[TriggerFireEvent], None],
+    ) -> bool:
+        try:
+            self._trigger_fire_hooks.remove(hook)
+        except ValueError:
+            return False
+        return True
+
+    def set_master_enabled(self, enabled: bool) -> None:
+        self.enabled = bool(enabled)
+
+    def explain_trigger(
+        self,
+        trigger_id: str,
+        line: str,
+        *,
+        styled_line: Optional[StyledLine] = None,
+        now: Optional[float] = None,
+    ) -> TriggerTestResult:
+        """Evaluate a trigger without firing it and explain the decision."""
+        trigger = self.triggers.get(trigger_id)
+        if trigger is None:
+            raise KeyError(trigger_id)
+        if now is None:
+            now = time.monotonic()
+
+        if not self.enabled:
+            return TriggerTestResult(
+                trigger_id, trigger.pattern, False, trigger.enabled, False,
+                bool(trigger.style_filter and trigger.style_filter.active),
+                styled_line is not None, None, True, False, reason="Master automation is disabled."
+            )
+        if not trigger.enabled:
+            return TriggerTestResult(
+                trigger_id, trigger.pattern, True, False, False,
+                bool(trigger.style_filter and trigger.style_filter.active),
+                styled_line is not None, None, True, False, reason="Trigger is disabled."
+            )
+
+        cooldown_ready = not (
+            trigger.cooldown_s > 0
+            and trigger._last_fired is not None
+            and (now - trigger._last_fired) < trigger.cooldown_s
+        )
+        match = trigger._regex.search(line)
+        style_required = bool(trigger.style_filter and trigger.style_filter.active)
+        style_available = styled_line is not None
+        style_matched: Optional[bool] = None
+        matched_text = match.group(0) if match is not None else ""
+
+        if match is None:
+            reason = "Regex did not match."
+            would_fire = False
+        elif style_required and styled_line is None:
+            reason = "Text matched, but ANSI/style evidence is unavailable."
+            would_fire = False
+        else:
+            if style_required:
+                assert trigger.style_filter is not None and styled_line is not None
+                style_matched = trigger.style_filter.matches_span(
+                    styled_line, match.start(), match.end()
+                )
+            if style_required and not style_matched:
+                reason = "Text matched, but the captured ANSI/style constraints did not."
+                would_fire = False
+            elif not cooldown_ready:
+                reason = "Text/style matched, but the trigger is still in cooldown."
+                would_fire = False
+            else:
+                reason = "Trigger would fire."
+                would_fire = True
+
+        return TriggerTestResult(
+            trigger_id=trigger_id,
+            pattern=trigger.pattern,
+            master_enabled=True,
+            trigger_enabled=True,
+            regex_matched=match is not None,
+            style_required=style_required,
+            style_available=style_available,
+            style_matched=style_matched,
+            cooldown_ready=cooldown_ready,
+            would_fire=would_fire,
+            matched_text=matched_text,
+            reason=reason,
+        )
+
     def _store_for_kind(
         self,
         kind: str,
@@ -852,66 +1120,79 @@ class AutomationEngine:
         self,
         line: str,
     ) -> Optional[str]:
+        """Process one complete plain-text game line.
+
+        Style-aware triggers intentionally do not fire through this legacy
+        plain-text entry point because no ANSI style evidence is available.
+        Use on_styled_text() when parsed presentation data exists.
         """
-        Process one complete plain-text game line.
+        return self._process_incoming(line, styled_line=None)
 
-        Returns:
-            original line
-                when it should remain visible
+    def on_styled_text(
+        self,
+        line: StyledLine,
+    ) -> Optional[str]:
+        """Process one complete parsed ANSI line, including style filters."""
+        return self._process_incoming(line.plain_text(), styled_line=line)
 
-            None
-                when one or more matching triggers gag it
-
-        Trigger actions run before event hooks.
-
-        A snapshot is used so actions/hooks may modify registration safely
-        without invalidating the active iteration.
-        """
-
-        display_line: Optional[
-            str
-        ] = line
+    def _process_incoming(
+        self,
+        line: str,
+        *,
+        styled_line: Optional[StyledLine],
+    ) -> Optional[str]:
+        display_line: Optional[str] = line
 
         ctx = TriggerContext(
             line=line,
             send=self.send,
             engine=self,
+            styled_line=styled_line,
         )
 
         now = time.monotonic()
 
-        for trigger in tuple(
-            self.triggers.values()
-        ):
-            match = trigger.check(
-                line,
-                now=now,
+        if self.enabled:
+            ordered_triggers = sorted(
+                tuple(self.triggers.values()),
+                key=lambda trigger: -trigger.priority,
             )
+            for trigger in ordered_triggers:
+                match = trigger.check(
+                    line,
+                    styled_line=styled_line,
+                    now=now,
+                )
+                if match is None:
+                    continue
 
-            if match is None:
-                continue
+                trigger.fire(match, ctx, now=now)
+                response = None
+                if trigger.response_template is not None:
+                    response = _substitute_numbered_groups(
+                        trigger.response_template, match.groups()
+                    )
+                event = TriggerFireEvent(
+                    trigger_id=trigger.id,
+                    pattern=trigger.pattern,
+                    line=line,
+                    matched_text=match.group(0),
+                    response=response,
+                    fired_at=time.time(),
+                )
+                for hook in tuple(self._trigger_fire_hooks):
+                    try:
+                        hook(event)
+                    except Exception:
+                        logger.exception("trigger fire hook raised")
+                if trigger.gag:
+                    display_line = None
 
-            trigger.fire(
-                match,
-                ctx,
-                now=now,
-            )
-
-            if trigger.gag:
-                display_line = None
-
-        for hook in tuple(
-            self._event_hooks
-        ):
+        for hook in tuple(self._event_hooks):
             try:
-                hook(
-                    line
-                )
-
+                hook(line)
             except Exception:
-                logger.exception(
-                    "event hook raised"
-                )
+                logger.exception("event hook raised")
 
         return display_line
 
@@ -932,6 +1213,9 @@ class AutomationEngine:
         command is suppressed rather than crashing the UI or accidentally
         sending the unresolved alias to the game.
         """
+
+        if not self.enabled:
+            return [command]
 
         for alias in tuple(
             self.aliases.values()
@@ -993,6 +1277,9 @@ class AutomationEngine:
         Repeating timers skip missed periods rather than producing a burst of
         catch-up actions after an event-loop stall.
         """
+
+        if not self.enabled:
+            return
 
         now = time.monotonic()
 
@@ -1058,16 +1345,21 @@ class AutomationEngine:
             bus_identity
         )
 
-        bus.on(
-            EventType.TEXT,
-            lambda event: self.on_text(
-                event.data
+        self._attached_bus_subscriptions[bus_identity] = [
+            bus.on(
+                EventType.TEXT,
+                lambda event: self.on_text(event.data),
             ),
-        )
+            bus.on(
+                EventType.PROMPT,
+                lambda event: self.on_text(event.data),
+            ),
+        ]
 
-        bus.on(
-            EventType.PROMPT,
-            lambda event: self.on_text(
-                event.data
-            ),
-        )
+    def detach(self, bus: "EventBus") -> None:
+        """Release subscriptions installed by :meth:`attach`."""
+        bus_identity = id(bus)
+        subscriptions = self._attached_bus_subscriptions.pop(bus_identity, [])
+        for subscription in subscriptions:
+            subscription.close()
+        self._attached_bus_ids.discard(bus_identity)

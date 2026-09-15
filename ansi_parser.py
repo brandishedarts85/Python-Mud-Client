@@ -47,6 +47,11 @@ _BASE16 = [
 _MAX_CSI_LEN = 128
 _MAX_OSC_LEN = 4096
 _MAX_SGR_PARAMS = 64
+MAX_LOGICAL_LINE_CHARS = 1024 * 1024
+
+
+class AnsiParseLimitError(ValueError):
+    """Raised when one logical terminal line exceeds defensive bounds."""
 
 
 @dataclass(frozen=True)
@@ -115,14 +120,29 @@ class AnsiParser:
     flush_line() is intended for telnet GA/EOR prompt boundaries.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_line_chars: int = MAX_LOGICAL_LINE_CHARS) -> None:
+        if max_line_chars <= 0:
+            raise ValueError("max_line_chars must be greater than zero")
+        self.max_line_chars = int(max_line_chars)
         self._style = DEFAULT_STYLE
         self._buffer = ""
         self._current = StyledLine()
+        self._current_chars = 0
+        self._discard_control: Optional[str] = None
+        self._discard_saw_esc = False
 
     def feed(self, text: str) -> list[StyledLine]:
         if not text:
             return []
+
+        # Oversized string/CSI controls are discarded across feed() boundaries
+        # until their real terminator arrives.  Without this state, dropping
+        # only the leading ESC would expose the remainder as visible text and
+        # could feed control payloads into triggers.
+        if self._discard_control is not None:
+            text = self._discard_control_prefix(text)
+            if not text:
+                return []
 
         self._buffer += text
         completed: list[StyledLine] = []
@@ -172,6 +192,7 @@ class AnsiParser:
                 plain_start = i
                 completed.append(self._current)
                 self._current = StyledLine()
+                self._current_chars = 0
                 continue
 
             if ch == "\n":
@@ -180,6 +201,7 @@ class AnsiParser:
                 plain_start = i
                 completed.append(self._current)
                 self._current = StyledLine()
+                self._current_chars = 0
                 continue
 
             i += 1
@@ -209,6 +231,7 @@ class AnsiParser:
 
         line = self._current
         self._current = StyledLine()
+        self._current_chars = 0
         return line
 
     def reset(self) -> None:
@@ -216,11 +239,19 @@ class AnsiParser:
         self._style = DEFAULT_STYLE
         self._buffer = ""
         self._current = StyledLine()
+        self._current_chars = 0
+        self._discard_control = None
+        self._discard_saw_esc = False
 
     def _append_segment(self, text: str, style: Style) -> None:
         """Append text while coalescing adjacent segments with equal style."""
         if not text:
             return
+        if self._current_chars + len(text) > self.max_line_chars:
+            raise AnsiParseLimitError(
+                f"logical ANSI line exceeds configured limit of {self.max_line_chars} characters"
+            )
+        self._current_chars += len(text)
         if self._current.segments and self._current.segments[-1].style == style:
             previous = self._current.segments[-1]
             self._current.segments[-1] = Segment(previous.text + text, style)
@@ -308,10 +339,21 @@ class AnsiParser:
         if i >= n:
             if n - start < _MAX_CSI_LEN:
                 return None
-            return start + 1
+            self._discard_control = "csi"
+            self._discard_saw_esc = False
+            return n
 
         if i >= max_end:
-            return start + 1
+            # The syntactic envelope exceeded our CSI budget.  If the final
+            # byte is already present later in this same chunk, discard through
+            # it and resume immediately.  Otherwise enter cross-feed discard
+            # mode until a final byte arrives.
+            for pos in range(max_end, n):
+                if 0x40 <= ord(buf[pos]) <= 0x7E:
+                    return pos + 1
+            self._discard_control = "csi"
+            self._discard_saw_esc = False
+            return n
 
         final = buf[i]
         if not (0x40 <= ord(final) <= 0x7E):
@@ -349,9 +391,20 @@ class AnsiParser:
         if limit == n and n - start < _MAX_OSC_LEN:
             return None
 
-        # Pathological unterminated OSC: abandon the ESC so the parser makes
-        # forward progress rather than retaining arbitrary amounts of input.
-        return start + 1
+        # Pathological unterminated OSC.  Continue looking for the real
+        # terminator in the rest of this chunk; if it is not present, discard
+        # subsequent chunks until BEL/ST rather than exposing OSC contents as
+        # ordinary MUD text.
+        i = limit
+        while i < n:
+            if buf[i] == "\x07":
+                return i + 1
+            if buf[i] == "\x1b" and i + 1 < n and buf[i + 1] == "\\":
+                return i + 2
+            i += 1
+        self._discard_control = "osc"
+        self._discard_saw_esc = bool(n and buf[-1] == "\x1b")
+        return n
 
     def _consume_st_string(self, buf: str, start: int) -> Optional[int]:
         """Consume DCS/SOS/PM/APC strings, terminated by ST (ESC \\)."""
@@ -370,7 +423,48 @@ class AnsiParser:
         if limit == n and n - start < _MAX_OSC_LEN:
             return None
 
-        return start + 1
+        i = limit
+        while i < n:
+            if buf[i] == "\x1b" and i + 1 < n and buf[i + 1] == "\\":
+                return i + 2
+            i += 1
+        self._discard_control = "st"
+        self._discard_saw_esc = bool(n and buf[-1] == "\x1b")
+        return n
+
+    def _discard_control_prefix(self, text: str) -> str:
+        """Discard bytes belonging to a previously oversized control string.
+
+        Return only text after the terminating byte/sequence.  The small
+        ``_discard_saw_esc`` flag handles an ST terminator split exactly between
+        two feed() calls.
+        """
+        mode = self._discard_control
+        if mode is None:
+            return text
+
+        if mode == "csi":
+            for index, ch in enumerate(text):
+                if 0x40 <= ord(ch) <= 0x7E:
+                    self._discard_control = None
+                    self._discard_saw_esc = False
+                    return text[index + 1 :]
+            return ""
+
+        for index, ch in enumerate(text):
+            if mode == "osc" and ch == "\x07":
+                self._discard_control = None
+                self._discard_saw_esc = False
+                return text[index + 1 :]
+
+            if self._discard_saw_esc and ch == "\\":
+                self._discard_control = None
+                self._discard_saw_esc = False
+                return text[index + 1 :]
+
+            self._discard_saw_esc = ch == "\x1b"
+
+        return ""
 
     # ------------------------------------------------------------------
     # SGR
@@ -582,6 +676,16 @@ class Scrollback:
 
     def append(self, line: StyledLine) -> None:
         self._lines.append(line)
+
+    def set_max_lines(self, max_lines: int) -> None:
+        """Resize the ring buffer while preserving the newest retained lines."""
+        if max_lines <= 0:
+            raise ValueError("max_lines must be greater than zero")
+        if max_lines == self.max_lines:
+            return
+        retained = list(self._lines)[-max_lines:]
+        self.max_lines = max_lines
+        self._lines = deque(retained, maxlen=max_lines)
 
     def extend(self, lines: list[StyledLine]) -> None:
         self._lines.extend(lines)
